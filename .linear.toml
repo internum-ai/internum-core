@@ -1,0 +1,6 @@
+# linear cli
+# https://github.com/schpet/linear-cli
+
+workspace = "internum-ai"
+team_id = "INT"
+issue_sort = "priority"
