@@ -1,9 +1,12 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import Self
 
 from internum_config import InternumBaseSettings
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import SettingsConfigDict
+
+LOCAL_ENV_FILE = "apps/api/.env"
 
 
 class ApiConsumerSettings(InternumBaseSettings):
@@ -23,6 +26,7 @@ class ApiConsumerSettings(InternumBaseSettings):
 class CoreSettings(InternumBaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="CORE_",
+        env_file=LOCAL_ENV_FILE,
         extra="forbid",
         case_sensitive=False,
     )
@@ -63,8 +67,8 @@ class CoreSettings(InternumBaseSettings):
         return None
 
     @classmethod
-    def from_env(cls) -> Self:
-        return cls()  # type: ignore[call-arg]
+    def from_env(cls, *, env_file: str | Path | None = LOCAL_ENV_FILE) -> Self:
+        return cls(_env_file=env_file)  # type: ignore[call-arg]
 
 
 @lru_cache

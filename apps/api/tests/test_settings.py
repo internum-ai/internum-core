@@ -16,7 +16,7 @@ def test_settings_parse_consumers_from_environment(monkeypatch: pytest.MonkeyPat
         '[{"id":"internal","api_key":"consumer-key","revoked":false}]',
     )
 
-    settings = CoreSettings.from_env()
+    settings = CoreSettings.from_env(env_file=None)
 
     assert settings.default_model == "openai/gpt-5.2"
     assert settings.api_consumers[0].id == "internal"
@@ -34,7 +34,28 @@ def test_missing_required_settings_fail_validation(monkeypatch: pytest.MonkeyPat
         monkeypatch.delenv(key, raising=False)
 
     with pytest.raises(ValidationError):
-        CoreSettings.from_env()
+        CoreSettings.from_env(env_file=None)
+
+
+def test_settings_parse_consumers_from_local_env_file(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    env_file = tmp_path / "local.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                'CORE_OPENROUTER_API_KEY="openrouter-key"',
+                'CORE_DEFAULT_MODEL="openai/gpt-5.2"',
+                'CORE_DEFAULT_SYSTEM_PROMPT="Extract facts."',
+                'CORE_TIMEOUT_SECONDS="20"',
+                'CORE_MAX_UPLOAD_BYTES="4096"',
+                'CORE_API_CONSUMERS=\'[{"id":"internal","api_key":"consumer-key","revoked":false}]\'',
+            ]
+        )
+    )
+
+    settings = CoreSettings.from_env(env_file=env_file)
+
+    assert settings.openrouter_api_key.get_secret_value() == "openrouter-key"
+    assert settings.api_consumers[0].api_key.get_secret_value() == "consumer-key"
 
 
 def test_safe_overrides_resolve_defaults_and_allowed_fields(core_settings: CoreSettings) -> None:
