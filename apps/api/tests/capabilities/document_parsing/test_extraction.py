@@ -4,12 +4,12 @@ from pathlib import Path
 import pytest
 
 from api.capabilities.document_parsing.extraction import (
-    OPENROUTER_BASE_URL,
     MarkItDownExtractor,
     build_markitdown_converter,
 )
 from api.capabilities.document_parsing.models import StoredUpload, SupportedDocumentType
 from api.config.settings import CoreSettings
+from api.platform.openrouter import OPENROUTER_BASE_URL
 
 
 def test_build_markitdown_converter_wires_openrouter_vision_client(

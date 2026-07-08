@@ -1,13 +1,14 @@
 import json
 import tempfile
 import zipfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
-from starlette.datastructures import FormData, UploadFile
+from starlette.datastructures import FormData, Headers, UploadFile
+from starlette.formparsers import MultiPartException, MultiPartParser
 from starlette.requests import Request
 
 from api.capabilities.document_parsing.models import (
@@ -26,20 +27,40 @@ except ImportError:  # pragma: no cover - dependency is declared, fallback is de
 
 CHUNK_SIZE = 1024 * 1024
 HEADER_BYTES = 4096
+FORM_FIELD_LIMIT_BYTES = 64 * 1024
+MULTIPART_OVERHEAD_BYTES = 64 * 1024
 
 
-async def parse_multipart_request(request: Request) -> ParseMultipartRequest:
-    form = await request.form()
-    upload = _extract_single_file(form)
-    schema = _extract_schema(form)
-    overrides = _extract_overrides(form)
-    additional_context = _optional_text(form, "additionalContext")
-    return ParseMultipartRequest(
-        upload=upload,
-        schema=schema,
-        additional_context=additional_context,
-        overrides=overrides,
-    )
+async def parse_multipart_request(
+    request: Request,
+    *,
+    max_upload_bytes: int,
+) -> ParseMultipartRequest:
+    _reject_oversized_body(request, max_upload_bytes=max_upload_bytes)
+    form: FormData | None = None
+    try:
+        form = await _parse_limited_multipart_form(
+            request,
+            max_upload_bytes=max_upload_bytes,
+        )
+        upload = _extract_single_file(form)
+        schema = _extract_schema(form)
+        overrides = _extract_overrides(form)
+        additional_context = _optional_text(form, "additionalContext")
+        return ParseMultipartRequest(
+            upload=upload,
+            schema=schema,
+            additional_context=additional_context,
+            overrides=overrides,
+        )
+    except MultiPartException as exc:
+        if form is not None:
+            await form.close()
+        raise IntakeError(_multipart_error_message(exc.message)) from exc
+    except Exception:
+        if form is not None:
+            await form.close()
+        raise
 
 
 @asynccontextmanager
@@ -121,6 +142,60 @@ def _extract_single_file(form: FormData) -> UploadFile:
     if len(files) != 1:
         raise IntakeError("Exactly one file must be provided")
     return files[0]
+
+
+def _reject_oversized_body(request: Request, *, max_upload_bytes: int) -> None:
+    content_length = request.headers.get("content-length")
+    if content_length is None:
+        return
+    try:
+        body_bytes = int(content_length)
+    except ValueError as exc:
+        raise IntakeError("Invalid Content-Length header") from exc
+    max_body_bytes = _max_body_bytes(max_upload_bytes)
+    if body_bytes > max_body_bytes:
+        raise IntakeError(
+            "Uploaded file exceeds the configured size limit",
+            details={"maxUploadBytes": max_upload_bytes},
+        )
+
+
+async def _parse_limited_multipart_form(
+    request: Request,
+    *,
+    max_upload_bytes: int,
+) -> FormData:
+    parser = MultiPartParser(
+        Headers(raw=request.headers.raw),
+        _limited_body_stream(request, max_body_bytes=_max_body_bytes(max_upload_bytes)),
+        max_files=1,
+        max_fields=4,
+        max_part_size=FORM_FIELD_LIMIT_BYTES,
+    )
+    return await parser.parse()
+
+
+async def _limited_body_stream(
+    request: Request,
+    *,
+    max_body_bytes: int,
+) -> AsyncGenerator[bytes, None]:
+    total_bytes = 0
+    async for chunk in request.stream():
+        total_bytes += len(chunk)
+        if total_bytes > max_body_bytes:
+            raise MultiPartException("Uploaded file exceeds the configured size limit")
+        yield chunk
+
+
+def _max_body_bytes(max_upload_bytes: int) -> int:
+    return max_upload_bytes + MULTIPART_OVERHEAD_BYTES
+
+
+def _multipart_error_message(detail: str) -> str:
+    if detail.startswith("Too many files."):
+        return "Exactly one file must be provided"
+    return detail
 
 
 def _extract_schema(form: FormData) -> dict[str, Any]:

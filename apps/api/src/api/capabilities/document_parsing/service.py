@@ -1,7 +1,6 @@
 from dataclasses import replace
 from typing import Any, Protocol
 
-from api.capabilities.document_parsing.extraction import build_extractor
 from api.capabilities.document_parsing.intake import stored_upload
 from api.capabilities.document_parsing.models import ParseMultipartRequest
 from api.common.errors import SchemaError
@@ -27,7 +26,7 @@ class DocumentParsingService:
     def __init__(
         self,
         settings: CoreSettings,
-        extractor: DocumentExtractor | None,
+        extractor: DocumentExtractor,
         openrouter_client: OpenRouterCompleter,
     ) -> None:
         self._settings = settings
@@ -46,8 +45,7 @@ class DocumentParsingService:
             request.upload,
             max_upload_bytes=self._settings.max_upload_bytes,
         ) as upload:
-            extractor = self._extractor or build_extractor(self._settings)
-            markdown = await extractor.extract(upload)
+            markdown = await self._extractor.extract(upload)
 
         openrouter_request = OpenRouterRequest(
             model=resolved.model,

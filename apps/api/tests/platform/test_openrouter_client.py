@@ -160,6 +160,100 @@ async def test_openrouter_client_maps_choice_errors_to_upstream_error(
 
 
 @pytest.mark.anyio
+async def test_openrouter_client_maps_transport_errors_to_upstream_error(
+    core_settings: CoreSettings,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection failed", request=request)
+
+    client = OpenRouterClient(
+        core_settings,
+        InMemoryUsageTracker(),
+        transport=httpx.MockTransport(handler),
+        backoff_seconds=0,
+    )
+
+    with pytest.raises(Exception, match="OpenRouter request failed"):
+        await client.complete(_openrouter_request())
+
+
+@pytest.mark.anyio
+async def test_openrouter_client_maps_malformed_success_json_to_upstream_error(
+    core_settings: CoreSettings,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"not-json")
+
+    client = OpenRouterClient(
+        core_settings,
+        InMemoryUsageTracker(),
+        transport=httpx.MockTransport(handler),
+        backoff_seconds=0,
+    )
+
+    with pytest.raises(Exception, match="OpenRouter response was not valid JSON"):
+        await client.complete(_openrouter_request())
+
+
+@pytest.mark.anyio
+async def test_openrouter_client_maps_malformed_choice_to_upstream_error(
+    core_settings: CoreSettings,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": ["bad"]})
+
+    client = OpenRouterClient(
+        core_settings,
+        InMemoryUsageTracker(),
+        transport=httpx.MockTransport(handler),
+        backoff_seconds=0,
+    )
+
+    with pytest.raises(Exception, match="OpenRouter response choice was malformed"):
+        await client.complete(_openrouter_request())
+
+
+@pytest.mark.anyio
+async def test_openrouter_client_maps_malformed_usage_cost_to_upstream_error(
+    core_settings: CoreSettings,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        response = _success_response()
+        response["usage"]["cost"] = "not-a-decimal"  # type: ignore[index]
+        return httpx.Response(200, json=response)
+
+    client = OpenRouterClient(
+        core_settings,
+        InMemoryUsageTracker(),
+        transport=httpx.MockTransport(handler),
+        backoff_seconds=0,
+    )
+
+    with pytest.raises(Exception, match="OpenRouter response usage cost was malformed"):
+        await client.complete(_openrouter_request())
+
+
+@pytest.mark.anyio
+async def test_openrouter_client_maps_non_finite_usage_cost_to_upstream_error(
+    core_settings: CoreSettings,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        response = _success_response()
+        response["usage"]["cost"] = "NaN"  # type: ignore[index]
+        return httpx.Response(200, json=response)
+
+    client = OpenRouterClient(
+        core_settings,
+        InMemoryUsageTracker(),
+        transport=httpx.MockTransport(handler),
+        backoff_seconds=0,
+    )
+
+    with pytest.raises(Exception, match="OpenRouter response usage cost was malformed"):
+        await client.complete(_openrouter_request())
+
+
+@pytest.mark.anyio
 async def test_openrouter_client_supports_image_content_parts(
     core_settings: CoreSettings,
 ) -> None:

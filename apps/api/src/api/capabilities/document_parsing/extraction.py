@@ -6,16 +6,13 @@ from starlette.concurrency import run_in_threadpool
 from api.capabilities.document_parsing.models import StoredUpload
 from api.common.errors import IntakeError
 from api.config.settings import CoreSettings
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+from api.platform.openrouter import build_openai_compatible_client
 
 
 class MarkItDownConverter(Protocol):
     def convert_local(
         self,
         path: str | Path,
-        *,
-        file_extension: str | None = None,
         **kwargs: Any,
     ) -> Any: ...
 
@@ -50,15 +47,7 @@ def build_markitdown_converter(
         from markitdown import MarkItDown
 
         markitdown_cls = MarkItDown
-    if openai_cls is None:
-        from openai import OpenAI
-
-        openai_cls = OpenAI
-
-    llm_client = openai_cls(
-        api_key=settings.openrouter_api_key.get_secret_value(),
-        base_url=OPENROUTER_BASE_URL,
-    )
+    llm_client = build_openai_compatible_client(settings, openai_cls=openai_cls)
     return markitdown_cls(
         enable_plugins=True,
         llm_client=llm_client,

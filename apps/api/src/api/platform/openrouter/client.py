@@ -1,6 +1,6 @@
 import asyncio
 import json
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
@@ -11,6 +11,7 @@ from api.config.settings import CoreSettings
 from api.platform.schema.normalize import normalize_for_model
 
 from .models import ImageInput, OpenRouterRequest, OpenRouterResult
+from .openai_compat import OPENROUTER_BASE_URL
 
 RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
@@ -22,7 +23,7 @@ class OpenRouterClient:
         usage_tracker: UsageTracker,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
-        base_url: str = "https://openrouter.ai/api/v1",
+        base_url: str = OPENROUTER_BASE_URL,
         max_retries: int = 2,
         backoff_seconds: float = 0.25,
     ) -> None:
@@ -94,24 +95,27 @@ class OpenRouterClient:
     ) -> OpenRouterResult:
         last_error: UpstreamError | None = None
         for attempt in range(self._max_retries + 1):
-            async with httpx.AsyncClient(
-                base_url=self._base_url,
-                timeout=self._settings.timeout_seconds,
-                transport=self._transport,
-            ) as client:
-                response = await client.post(
-                    "/chat/completions",
-                    headers={
-                        "Authorization": (
-                            f"Bearer {self._settings.openrouter_api_key.get_secret_value()}"
-                        ),
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                )
+            try:
+                async with httpx.AsyncClient(
+                    base_url=self._base_url,
+                    timeout=self._settings.timeout_seconds,
+                    transport=self._transport,
+                ) as client:
+                    response = await client.post(
+                        "/chat/completions",
+                        headers={
+                            "Authorization": (
+                                f"Bearer {self._settings.openrouter_api_key.get_secret_value()}"
+                            ),
+                            "Content-Type": "application/json",
+                        },
+                        json=payload,
+                    )
+            except httpx.RequestError as exc:
+                raise UpstreamError("OpenRouter request failed") from exc
 
             if response.status_code < 400:
-                result = self._parse_success_response(response.json(), request)
+                result = self._parse_success_response(_json_response(response), request)
                 self._record_usage(result, request)
                 return result
 
@@ -132,17 +136,18 @@ class OpenRouterClient:
             raise UpstreamError("OpenRouter response did not include choices")
 
         choice = choices[0]
-        if isinstance(choice, dict) and choice.get("error"):
+        if not isinstance(choice, dict):
+            raise UpstreamError("OpenRouter response choice was malformed")
+        if choice.get("error"):
             raise UpstreamError("OpenRouter provider returned an error")
 
-        message = choice.get("message") if isinstance(choice, dict) else None
+        message = choice.get("message")
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str):
             raise UpstreamError("OpenRouter response did not include text content")
 
         usage_data = data.get("usage")
         usage = usage_data if isinstance(usage_data, dict) else {}
-        cost = usage.get("cost")
         result = OpenRouterResult(
             content=content,
             model=str(data.get("model") or request.model),
@@ -150,7 +155,7 @@ class OpenRouterClient:
             prompt_tokens=_int_usage(usage.get("prompt_tokens")),
             completion_tokens=_int_usage(usage.get("completion_tokens")),
             total_tokens=_int_usage(usage.get("total_tokens")),
-            cost_usd=Decimal(str(cost)) if cost is not None else None,
+            cost_usd=_decimal_usage_cost(usage.get("cost")),
         )
         return result
 
@@ -198,6 +203,16 @@ def _map_error_response(response: httpx.Response) -> UpstreamError:
     return UpstreamError(message)
 
 
+def _json_response(response: httpx.Response) -> dict[str, Any]:
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise UpstreamError("OpenRouter response was not valid JSON") from exc
+    if not isinstance(data, dict):
+        raise UpstreamError("OpenRouter response JSON was malformed")
+    return data
+
+
 def _is_native_schema_rejection(error: UpstreamError) -> bool:
     message = error.message.lower()
     markers = ("schema", "response_format", "structured", "require_parameters", "unsupported")
@@ -206,3 +221,15 @@ def _is_native_schema_rejection(error: UpstreamError) -> bool:
 
 def _int_usage(value: Any) -> int:
     return value if isinstance(value, int) else 0
+
+
+def _decimal_usage_cost(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        cost = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise UpstreamError("OpenRouter response usage cost was malformed") from exc
+    if not cost.is_finite():
+        raise UpstreamError("OpenRouter response usage cost was malformed")
+    return cost

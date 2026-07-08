@@ -2,6 +2,8 @@ import json
 import zipfile
 from io import BytesIO
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from api.config.settings import CoreSettings
@@ -74,6 +76,19 @@ def test_unsupported_file_type_is_rejected(core_settings: CoreSettings) -> None:
     assert response.json()["error"]["code"] == "intake_error"
 
 
+def test_invalid_schema_after_upload_parse_closes_temp_file(core_settings: CoreSettings) -> None:
+    app = create_app(settings=core_settings)
+    response = TestClient(app).post(
+        "/v1/parse",
+        headers={"X-API-Key": "valid-key"},
+        data={"schema": "{not-json"},
+        files={"file": ("sample.pdf", b"%PDF-1.4\ncontent", "application/pdf")},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "Schema field must contain valid JSON"
+
+
 def test_oversized_file_is_rejected(core_settings: CoreSettings) -> None:
     settings = core_settings.model_copy(update={"max_upload_bytes": 4})
     app = create_app(settings=settings)
@@ -87,6 +102,62 @@ def test_oversized_file_is_rejected(core_settings: CoreSettings) -> None:
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "intake_error"
+
+
+def test_oversized_body_is_rejected_before_form_processing(core_settings: CoreSettings) -> None:
+    settings = core_settings.model_copy(update={"max_upload_bytes": 4})
+    app = create_app(settings=settings)
+
+    response = TestClient(app).post(
+        "/v1/parse",
+        headers={
+            "X-API-Key": "valid-key",
+            "Content-Length": str(4 + 64 * 1024 + 1),
+            "Content-Type": "multipart/form-data; boundary=fake",
+        },
+        content=b"",
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "Uploaded file exceeds the configured size limit"
+
+
+@pytest.mark.anyio
+async def test_chunked_oversized_body_is_rejected_during_form_processing(
+    core_settings: CoreSettings,
+) -> None:
+    settings = core_settings.model_copy(update={"max_upload_bytes": 4})
+    app = create_app(settings=settings)
+    body = (
+        b"--internum\r\n"
+        b'Content-Disposition: form-data; name="schema"\r\n\r\n'
+        + _schema().encode()
+        + b"\r\n--internum\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="sample.pdf"\r\n'
+        b"Content-Type: application/pdf\r\n\r\n"
+        b"%PDF-1.4\nlarge"
+        b"\r\n--internum--\r\n"
+    )
+
+    async def chunks():
+        for index in range(0, len(body), 7):
+            yield body[index : index + 7]
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/v1/parse",
+            headers={
+                "X-API-Key": "valid-key",
+                "Content-Type": "multipart/form-data; boundary=internum",
+            },
+            content=chunks(),
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "Uploaded file exceeds the configured size limit"
 
 
 def test_multiple_files_are_rejected(core_settings: CoreSettings) -> None:
