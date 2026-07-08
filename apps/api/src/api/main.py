@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from api.capabilities.document_parsing import router as document_parsing_router
 from api.common.errors import install_exception_handlers
 from api.common.logging import RequestContextMiddleware
 from api.common.usage import InMemoryUsageTracker
@@ -25,6 +26,8 @@ def create_app(settings: CoreSettings | None = None) -> FastAPI:
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    app.include_router(document_parsing_router)
 
     return app
 

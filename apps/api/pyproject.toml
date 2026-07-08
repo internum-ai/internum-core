@@ -10,6 +10,11 @@ dependencies = [
     "internum-shared",
     "json-repair>=0.61.2",
     "jsonschema>=4.26.0",
+    "markitdown-ocr>=0.1.0",
+    "markitdown[all]>=0.1.5",
+    "openai>=2.44.0",
+    "python-magic>=0.4.27",
+    "python-multipart>=0.0.32",
     "uvicorn[standard]>=0.35.0",
 ]
 
