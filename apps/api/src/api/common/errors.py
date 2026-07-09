@@ -24,10 +24,13 @@ class ApiError(Exception):
 
 
 class ConfigurationError(ApiError):
-    def __init__(self, message: str = "Invalid server configuration") -> None:
-        super().__init__(
-            "configuration_error", message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-        )
+    def __init__(
+        self,
+        message: str = "Invalid server configuration",
+        *,
+        code: str = "configuration_error",
+    ) -> None:
+        super().__init__(code, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
 
 
 class AuthenticationError(ApiError):
@@ -42,10 +45,14 @@ class AuthenticationError(ApiError):
 
 
 class IntakeError(ApiError):
-    def __init__(self, message: str, *, details: dict[str, Any] | None = None) -> None:
-        super().__init__(
-            "intake_error", message, status_code=HTTPStatus.BAD_REQUEST, details=details
-        )
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "intake_error",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(code, message, status_code=HTTPStatus.BAD_REQUEST, details=details)
 
 
 class SchemaError(ApiError):

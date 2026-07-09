@@ -1,7 +1,7 @@
 from fastapi import Request
 
 from api.capabilities.document_parsing.extraction import build_extractor
-from api.capabilities.document_parsing.models import StoredUpload
+from api.capabilities.document_parsing.models import ExtractedDocument, StoredUpload
 from api.capabilities.document_parsing.service import (
     DocumentExtractor,
     DocumentParsingService,
@@ -43,7 +43,7 @@ class LazyDocumentExtractor:
         self._settings = settings
         self._extractor: DocumentExtractor | None = None
 
-    async def extract(self, upload: StoredUpload) -> str:
+    async def extract(self, upload: StoredUpload) -> ExtractedDocument | str:
         if self._extractor is None:
             self._extractor = build_extractor(self._settings)
         return await self._extractor.extract(upload)

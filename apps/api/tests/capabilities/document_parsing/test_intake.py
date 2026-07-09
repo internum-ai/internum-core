@@ -1,6 +1,7 @@
 import json
 import zipfile
 from io import BytesIO
+from pathlib import Path
 
 import httpx
 import pytest
@@ -26,6 +27,14 @@ def _docx_bytes() -> bytes:
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("[Content_Types].xml", "<Types />")
         archive.writestr("word/document.xml", "<document />")
+    return buffer.getvalue()
+
+
+def _png_bytes(size: tuple[int, int] = (8, 8)) -> bytes:
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", size, color="white").save(buffer, format="PNG")
     return buffer.getvalue()
 
 
@@ -57,7 +66,16 @@ def test_valid_docx_intake_reaches_parser_and_cleans_temp_file(
     )
 
     assert response.status_code == 200
-    assert response.json() == {"data": {"name": "Ada"}}
+    assert response.json() == {
+        "data": {"name": "Ada"},
+        "meta": {
+            "documentType": "docx",
+            "extractionMode": None,
+            "pageCount": None,
+            "ocrPageCount": None,
+            "converter": None,
+        },
+    }
     assert captured_paths
     assert not any_path_exists(captured_paths)
 
@@ -73,7 +91,71 @@ def test_unsupported_file_type_is_rejected(core_settings: CoreSettings) -> None:
     )
 
     assert response.status_code == 400
-    assert response.json()["error"]["code"] == "intake_error"
+    assert response.json()["error"]["code"] == "unsupported_file_type"
+
+
+def test_generic_ole_file_without_supported_suffix_is_rejected(
+    core_settings: CoreSettings,
+) -> None:
+    app = create_app(settings=core_settings)
+
+    response = TestClient(app).post(
+        "/v1/parse",
+        headers={"X-API-Key": "valid-key"},
+        data={"schema": _schema()},
+        files={
+            "file": (
+                "sample.bin",
+                b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1ole",
+                "application/octet-stream",
+            )
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unsupported_file_type"
+
+
+@pytest.mark.parametrize(
+    ("filename", "content", "expected_type"),
+    [
+        ("sample.html", b"<!doctype html><html><body>Title</body></html>", "html"),
+        ("sample.htm", b"<html><body>Title</body></html>", "html"),
+        ("sample.doc", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1doc", "doc"),
+        ("sample.xls", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1xls", "xls"),
+    ],
+)
+def test_new_supported_suffixes_reach_parser(
+    core_settings: CoreSettings,
+    filename: str,
+    content: bytes,
+    expected_type: str,
+) -> None:
+    app = create_app(settings=core_settings)
+    captured_types: list[str] = []
+
+    class Extractor:
+        async def extract(self, upload):  # type: ignore[no-untyped-def]
+            captured_types.append(upload.document_type.value)
+            return "Name: Ada"
+
+    class Client:
+        async def complete(self, request):  # type: ignore[no-untyped-def]
+            return _result('{"name":"Ada"}')
+
+    app.state.document_extractor = Extractor()
+    app.state.openrouter_client = Client()
+
+    response = TestClient(app).post(
+        "/v1/parse",
+        headers={"X-API-Key": "valid-key"},
+        data={"schema": _schema()},
+        files={"file": (filename, content, "application/octet-stream")},
+    )
+
+    assert response.status_code == 200
+    assert captured_types == [expected_type]
+    assert response.json()["meta"]["documentType"] == expected_type
 
 
 def test_invalid_schema_after_upload_parse_closes_temp_file(core_settings: CoreSettings) -> None:
@@ -102,6 +184,39 @@ def test_oversized_file_is_rejected(core_settings: CoreSettings) -> None:
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "intake_error"
+
+
+def test_oversized_image_dimensions_return_stable_error(core_settings: CoreSettings) -> None:
+    settings = core_settings.model_copy(update={"max_image_pixels": 4})
+    app = create_app(settings=settings)
+
+    response = TestClient(app).post(
+        "/v1/parse",
+        headers={"X-API-Key": "valid-key"},
+        data={"schema": _schema()},
+        files={"file": ("sample.png", _png_bytes((3, 3)), "image/png")},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "image_too_large"
+
+
+def test_ooxml_archive_with_unsafe_path_is_rejected(core_settings: CoreSettings) -> None:
+    app = create_app(settings=core_settings)
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types />")
+        archive.writestr("../word/document.xml", "<document />")
+
+    response = TestClient(app).post(
+        "/v1/parse",
+        headers={"X-API-Key": "valid-key"},
+        data={"schema": _schema()},
+        files={"file": ("sample.docx", buffer.getvalue(), "application/octet-stream")},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unsafe_archive"
 
 
 def test_oversized_body_is_rejected_before_form_processing(core_settings: CoreSettings) -> None:
@@ -178,8 +293,6 @@ def test_multiple_files_are_rejected(core_settings: CoreSettings) -> None:
 
 
 def any_path_exists(paths: list[str]) -> bool:
-    from pathlib import Path
-
     return any(Path(path).exists() for path in paths)
 
 

@@ -16,9 +16,14 @@ from api.platform.openrouter import OpenRouterResult
     [
         ("sample.pdf", b"%PDF-1.4\nTitle: PDF"),
         ("sample.docx", lambda: _office_zip("word/document.xml")),
+        ("sample.doc", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1doc"),
+        ("sample.html", b"<!doctype html><html><body>Title</body></html>"),
+        ("sample.htm", b"<html><body>Title</body></html>"),
         ("sample.xlsx", lambda: _office_zip("xl/workbook.xml")),
-        ("sample.png", b"\x89PNG\r\n\x1a\nimage"),
-        ("sample.jpg", b"\xff\xd8\xff\xe0image"),
+        ("sample.xls", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1xls"),
+        ("sample.png", lambda: _image_bytes("PNG")),
+        ("sample.jpg", lambda: _image_bytes("JPEG")),
+        ("sample.jpeg", lambda: _image_bytes("JPEG")),
     ],
 )
 def test_parse_endpoint_accepts_supported_file_classes_and_preserves_nulls(
@@ -39,7 +44,17 @@ def test_parse_endpoint_accepts_supported_file_classes_and_preserves_nulls(
     )
 
     assert response.status_code == 200
-    assert response.json() == {"data": {"title": filename, "unresolved": None}}
+    assert response.json()["data"] == {"title": filename, "unresolved": None}
+    assert response.json()["meta"]["documentType"] in {
+        "pdf",
+        "docx",
+        "doc",
+        "html",
+        "xlsx",
+        "xls",
+        "png",
+        "jpg",
+    }
 
 
 class Extractor:
@@ -80,4 +95,12 @@ def _office_zip(member: str) -> bytes:
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("[Content_Types].xml", "<Types />")
         archive.writestr(member, "<document />")
+    return buffer.getvalue()
+
+
+def _image_bytes(format_name: str) -> bytes:
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (8, 8), color="white").save(buffer, format=format_name)
     return buffer.getvalue()

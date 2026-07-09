@@ -36,9 +36,19 @@ class CoreSettings(InternumBaseSettings):
     default_system_prompt: str = Field(min_length=1)
     timeout_seconds: float = Field(gt=0)
     max_upload_bytes: int = Field(gt=0)
+    max_image_pixels: int = Field(default=25_000_000, gt=0)
+    max_pdf_pages: int = Field(default=200, gt=0)
+    max_ocr_pages: int = Field(default=25, ge=0)
+    max_ocr_rendered_pixels: int = Field(default=20_000_000, gt=0)
+    ocr_render_dpi: int = Field(default=200, gt=0)
+    max_ooxml_zip_entries: int = Field(default=1_000, gt=0)
+    max_ooxml_uncompressed_bytes: int = Field(default=100 * 1024 * 1024, gt=0)
+    max_ooxml_compression_ratio: float = Field(default=100.0, gt=0)
+    libreoffice_binary: str = Field(default="soffice", min_length=1)
+    doc_conversion_timeout_seconds: float = Field(default=30.0, gt=0)
     api_consumers: list[ApiConsumerSettings] = Field(min_length=1)
 
-    @field_validator("default_model", "default_system_prompt")
+    @field_validator("default_model", "default_system_prompt", "libreoffice_binary")
     @classmethod
     def strip_required_text(cls, value: str) -> str:
         stripped = value.strip()

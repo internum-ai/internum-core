@@ -3,6 +3,12 @@ from decimal import Decimal
 
 from fastapi.testclient import TestClient
 
+from api.capabilities.document_parsing.models import (
+    ExtractedDocument,
+    ExtractionMode,
+    ParseMetadata,
+    SupportedDocumentType,
+)
 from api.config.settings import CoreSettings
 from api.main import create_app
 from api.platform.openrouter import OpenRouterResult
@@ -24,7 +30,18 @@ def _schema() -> str:
 
 class Extractor:
     async def extract(self, upload):  # type: ignore[no-untyped-def]
-        return "Name: Ada"
+        return ExtractedDocument(
+            markdown="Name: Ada",
+            metadata=ParseMetadata(
+                document_type=upload.document_type,
+                extraction_mode=ExtractionMode.NATIVE
+                if upload.document_type is SupportedDocumentType.PDF
+                else None,
+                page_count=1 if upload.document_type is SupportedDocumentType.PDF else None,
+                ocr_page_count=0 if upload.document_type is SupportedDocumentType.PDF else None,
+                converter="markitdown",
+            ),
+        )
 
 
 class QueueingClient:
@@ -64,7 +81,16 @@ def test_parse_endpoint_returns_schema_validated_json_with_nulls(
     )
 
     assert response.status_code == 200
-    assert response.json() == {"data": {"name": "Ada", "missing": None}}
+    assert response.json() == {
+        "data": {"name": "Ada", "missing": None},
+        "meta": {
+            "documentType": "pdf",
+            "extractionMode": "native",
+            "pageCount": 1,
+            "ocrPageCount": 0,
+            "converter": "markitdown",
+        },
+    }
     assert client.requests[0].model == "anthropic/claude-sonnet-4.5"
     assert client.requests[0].system_prompt == "Return JSON only."
     assert "Use the document title." in client.requests[0].user_content
@@ -84,7 +110,16 @@ def test_parse_endpoint_retries_once_after_schema_validation_failure(
     )
 
     assert response.status_code == 200
-    assert response.json() == {"data": {"name": "Ada", "missing": None}}
+    assert response.json() == {
+        "data": {"name": "Ada", "missing": None},
+        "meta": {
+            "documentType": "pdf",
+            "extractionMode": "native",
+            "pageCount": 1,
+            "ocrPageCount": 0,
+            "converter": "markitdown",
+        },
+    }
     assert len(client.requests) == 2
     assert client.requests[1].validation_retry_prompt is not None
 

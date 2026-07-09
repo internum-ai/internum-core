@@ -18,9 +18,9 @@ async def parse_document(request: Request) -> dict[str, Any]:
     )
     consumer = getattr(request.state, "consumer", None)
     service = get_document_parsing_service(request, settings)
-    data = await service.parse(
+    parsed = await service.parse(
         parse_request,
         consumer_id=consumer.id if isinstance(consumer, ConsumerIdentity) else None,
         request_id=getattr(request.state, "request_id", None),
     )
-    return {"data": data}
+    return {"data": parsed.data, "meta": parsed.metadata.to_api()}

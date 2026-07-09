@@ -2,7 +2,12 @@ from dataclasses import replace
 from typing import Any, Protocol
 
 from api.capabilities.document_parsing.intake import stored_upload
-from api.capabilities.document_parsing.models import ParseMultipartRequest
+from api.capabilities.document_parsing.models import (
+    ExtractedDocument,
+    ParsedDocument,
+    ParseMetadata,
+    ParseMultipartRequest,
+)
 from api.common.errors import SchemaError
 from api.config.overrides import resolve_request_overrides
 from api.config.settings import CoreSettings
@@ -19,7 +24,7 @@ class OpenRouterCompleter(Protocol):
 
 
 class DocumentExtractor(Protocol):
-    async def extract(self, upload: Any) -> str: ...
+    async def extract(self, upload: Any) -> ExtractedDocument | str: ...
 
 
 class DocumentParsingService:
@@ -39,13 +44,29 @@ class DocumentParsingService:
         *,
         consumer_id: str | None,
         request_id: str | None,
-    ) -> dict[str, Any]:
+    ) -> ParsedDocument:
         resolved = resolve_request_overrides(self._settings, request.overrides)
         async with stored_upload(
             request.upload,
             max_upload_bytes=self._settings.max_upload_bytes,
+            max_image_pixels=self._settings.max_image_pixels,
+            max_ooxml_zip_entries=self._settings.max_ooxml_zip_entries,
+            max_ooxml_uncompressed_bytes=self._settings.max_ooxml_uncompressed_bytes,
+            max_ooxml_compression_ratio=self._settings.max_ooxml_compression_ratio,
         ) as upload:
-            markdown = await self._extractor.extract(upload)
+            extracted = await self._extractor.extract(upload)
+            if isinstance(extracted, ExtractedDocument):
+                markdown = extracted.markdown
+                metadata = extracted.metadata
+            else:
+                markdown = extracted
+                metadata = ParseMetadata(
+                    document_type=upload.document_type,
+                    extraction_mode=None,
+                    page_count=None,
+                    ocr_page_count=None,
+                    converter=None,
+                )
 
         openrouter_request = OpenRouterRequest(
             model=resolved.model,
@@ -58,7 +79,7 @@ class DocumentParsingService:
         )
         result = await self._openrouter_client.complete(openrouter_request)
         try:
-            return _repair_and_validate(result.content, request.schema)
+            data = _repair_and_validate(result.content, request.schema)
         except SchemaError as error:
             retry_result = await self._openrouter_client.complete(
                 replace(
@@ -66,7 +87,9 @@ class DocumentParsingService:
                     validation_retry_prompt=format_validation_retry(error),
                 )
             )
-            return _repair_and_validate(retry_result.content, request.schema)
+            data = _repair_and_validate(retry_result.content, request.schema)
+
+        return ParsedDocument(data=data, metadata=metadata)
 
 
 def _build_user_content(markdown: str, additional_context: str | None) -> str:

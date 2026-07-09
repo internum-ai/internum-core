@@ -1,6 +1,8 @@
 import io
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 from collections.abc import Iterable
 from pathlib import Path
@@ -38,11 +40,22 @@ def main() -> int:
                 if response.status_code != 200:
                     print(f"Smoke failed for {sample.name}: {response.status_code} {response.text}")
                     return 1
-                data = response.json()["data"]
+                body = response.json()
+                data = body.get("data")
+                meta = body.get("meta")
+                if not isinstance(data, dict) or not isinstance(meta, dict):
+                    print(f"Smoke failed for {sample.name}: response missing data/meta: {body}")
+                    return 1
                 if "unresolvedField" not in data or data["unresolvedField"] is not None:
                     print(f"Smoke failed for {sample.name}: unresolvedField was not null: {data}")
                     return 1
-                print(f"Smoke passed for {sample.name}: {json.dumps(data, sort_keys=True)}")
+                if "documentType" not in meta:
+                    print(f"Smoke failed for {sample.name}: meta missing documentType: {meta}")
+                    return 1
+                print(
+                    f"Smoke passed for {sample.name}: "
+                    f"{json.dumps({'data': data, 'meta': meta}, sort_keys=True)}"
+                )
 
     return 0
 
@@ -66,12 +79,16 @@ def _post_sample(
 
 
 def _create_samples(temp_dir: Path) -> Iterable[Path]:
-    return [
+    samples = [
         _create_pdf(temp_dir / "sample.pdf"),
+        _create_scanned_pdf(temp_dir / "sample-scanned.pdf"),
         _create_docx(temp_dir / "sample.docx"),
+        _create_html(temp_dir / "sample.html"),
         _create_xlsx(temp_dir / "sample.xlsx"),
         _create_png(temp_dir / "sample.png"),
     ]
+    samples.extend(_create_legacy_office_samples(temp_dir))
+    return samples
 
 
 def _create_pdf(path: Path) -> Path:
@@ -105,6 +122,11 @@ def _create_xlsx(path: Path) -> Path:
     return path
 
 
+def _create_html(path: Path) -> Path:
+    path.write_text("<!doctype html><html><body><h1>Title: Smoke HTML</h1></body></html>")
+    return path
+
+
 def _create_png(path: Path) -> Path:
     from PIL import Image, ImageDraw
 
@@ -115,6 +137,80 @@ def _create_png(path: Path) -> Path:
     image.save(buffer, format="PNG")
     path.write_bytes(buffer.getvalue())
     return path
+
+
+def _create_scanned_pdf(path: Path) -> Path:
+    import fitz
+
+    image_path = path.with_suffix(".png")
+    _create_png(image_path)
+    document = fitz.open()
+    page = document.new_page(width=500, height=140)
+    page.insert_image(page.rect, filename=str(image_path))
+    document.save(path)
+    document.close()
+    return path
+
+
+def _create_legacy_office_samples(temp_dir: Path) -> list[Path]:
+    binary = _libreoffice_binary()
+    if binary is None:
+        print("DOC/XLS smoke samples skipped: LibreOffice binary is unavailable.")
+        return []
+
+    samples: list[Path] = []
+    xlsx_source = _create_xlsx(temp_dir / "legacy-source.xlsx")
+    xls_path = _convert_office_sample(binary, xlsx_source, "xls", temp_dir)
+    if xls_path is not None:
+        samples.append(xls_path.rename(temp_dir / "sample.xls"))
+
+    docx_source = _create_docx(temp_dir / "legacy-source.docx")
+    doc_path = _convert_office_sample(binary, docx_source, "doc", temp_dir)
+    if doc_path is not None:
+        samples.append(doc_path.rename(temp_dir / "sample.doc"))
+    else:
+        print("DOC smoke sample skipped: LibreOffice could not create a DOC sample.")
+
+    return samples
+
+
+def _convert_office_sample(
+    binary: str,
+    source: Path,
+    target_extension: str,
+    outdir: Path,
+) -> Path | None:
+    completed = subprocess.run(
+        [
+            binary,
+            "--headless",
+            "--nologo",
+            "--nolockcheck",
+            "--nodefault",
+            "--nofirststartwizard",
+            "--convert-to",
+            target_extension,
+            "--outdir",
+            str(outdir),
+            str(source),
+        ],
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    output = source.with_suffix(f".{target_extension}")
+    if completed.returncode != 0 or not output.exists():
+        print(f"{target_extension.upper()} smoke sample skipped: LibreOffice conversion failed.")
+        return None
+    return output
+
+
+def _libreoffice_binary() -> str | None:
+    configured = os.getenv("CORE_LIBREOFFICE_BINARY", "soffice")
+    path = Path(configured)
+    if path.is_absolute() or "/" in configured:
+        return str(path) if path.exists() else None
+    return shutil.which(configured)
 
 
 if __name__ == "__main__":
