@@ -1,4 +1,5 @@
 from api.platform.schema.normalize import normalize_for_model
+from api.platform.schema.postprocess import normalize_values
 from api.platform.schema.repair import repair_json_output
 from api.platform.schema.validate import (
     evaluate_post_checks,
@@ -10,6 +11,7 @@ __all__ = [
     "evaluate_post_checks",
     "format_validation_retry",
     "normalize_for_model",
+    "normalize_values",
     "repair_json_output",
     "validate_against_original",
 ]

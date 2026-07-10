@@ -5,6 +5,7 @@ from api.platform.schema import (
     evaluate_post_checks,
     format_validation_retry,
     normalize_for_model,
+    normalize_values,
     repair_json_output,
     validate_against_original,
 )
@@ -166,3 +167,120 @@ def test_evaluate_post_checks_fans_out_over_scope_array() -> None:
     assert results[0].passed is True
     assert results[1].passed is False
     assert results[1].detail.get("index") == 1
+
+
+def test_normalize_values_converts_croatian_date_when_hinted() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"issuedAt": {"type": "string", "format": "date"}},
+    }
+
+    result = normalize_values({"issuedAt": "5.7.2026."}, schema)
+
+    assert result == {"issuedAt": "2026-07-05"}
+
+
+def test_normalize_values_leaves_non_matching_date_unchanged() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"issuedAt": {"type": "string", "format": "date"}},
+    }
+
+    result = normalize_values({"issuedAt": "not a date"}, schema)
+
+    assert result == {"issuedAt": "not a date"}
+
+
+def test_normalize_values_strips_non_digits_when_hinted() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"ean": {"type": "string", "x-normalize": "digits"}},
+    }
+
+    result = normalize_values({"ean": "978-953-358-763-9"}, schema)
+
+    assert result == {"ean": "9789533587639"}
+
+
+def test_normalize_values_collapses_whitespace_when_hinted() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"name": {"type": "string", "x-normalize": "collapse-whitespace"}},
+    }
+
+    result = normalize_values({"name": "  Ada   Lovelace \n"}, schema)
+
+    assert result == {"name": "Ada Lovelace"}
+
+
+def test_normalize_values_applies_list_of_hints_in_order() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string",
+                "x-normalize": ["collapse-whitespace", "digits"],
+            }
+        },
+    }
+
+    result = normalize_values({"code": " 978 953  358 "}, schema)
+
+    assert result == {"code": "978953358"}
+
+
+def test_normalize_values_recurses_into_nested_objects() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "supplier": {
+                "type": "object",
+                "properties": {"ean": {"type": "string", "x-normalize": "digits"}},
+            }
+        },
+    }
+
+    result = normalize_values({"supplier": {"ean": "978-1"}}, schema)
+
+    assert result == {"supplier": {"ean": "9781"}}
+
+
+def test_normalize_values_recurses_into_arrays_of_objects() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "rows": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"date": {"type": ["string", "null"], "format": "date"}},
+                },
+            }
+        },
+    }
+
+    result = normalize_values({"rows": [{"date": "1.1.2026"}, {"date": "2.2.2026."}]}, schema)
+
+    assert result == {"rows": [{"date": "2026-01-01"}, {"date": "2026-02-02"}]}
+
+
+def test_normalize_values_passes_through_null_values() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"issuedAt": {"type": ["string", "null"], "format": "date"}},
+    }
+
+    result = normalize_values({"issuedAt": None}, schema)
+
+    assert result == {"issuedAt": None}
+
+
+def test_normalize_values_passes_through_fields_without_hints() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"note": {"type": "string"}},
+    }
+
+    result = normalize_values({"note": "  1.1.2026.  "}, schema)
+
+    assert result == {"note": "  1.1.2026.  "}

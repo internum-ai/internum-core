@@ -164,6 +164,33 @@ class TestBuildChunkPlan:
         assert set(plan.summary_schema["properties"]) == {"total"}
         assert plan.summary_schema["required"] == ["total"]
 
+    def test_summary_markdown_includes_leading_data_rows_when_preamble_empty(self) -> None:
+        header = "| id | value |"
+        delimiter = "| --- | --- |"
+        label_rows = [
+            "| Dobavljac | Acme d.o.o. |",
+            "| Period | 01.05.2026-31.05.2026 |",
+        ]
+        data_rows = [f"| {index} | v{index} |" for index in range(100)]
+        markdown = "\n".join([header, delimiter, *label_rows, *data_rows])
+        config = ChunkingConfig(row_threshold=60, rows_per_chunk=50)
+
+        plan = build_chunk_plan(markdown, _row_array_schema(), config)
+
+        assert plan is not None
+        assert "Dobavljac" in plan.summary_markdown
+        assert "Period" in plan.summary_markdown
+
+    def test_summary_markdown_bounds_leading_rows_to_rows_per_chunk(self) -> None:
+        markdown = _table_markdown(100)
+        config = ChunkingConfig(row_threshold=60, rows_per_chunk=50)
+
+        plan = build_chunk_plan(markdown, _row_array_schema(), config)
+
+        assert plan is not None
+        assert "v49" in plan.summary_markdown
+        assert "v50" not in plan.summary_markdown
+
     def test_summary_schema_is_none_when_no_other_properties(self) -> None:
         markdown = _table_markdown(100)
         schema = {

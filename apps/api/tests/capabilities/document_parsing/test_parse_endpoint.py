@@ -134,6 +134,34 @@ def test_parse_endpoint_returns_schema_validated_json_with_nulls(
     assert "Use the document title." in client.requests[0].user_content
 
 
+def test_parse_endpoint_normalizes_hinted_field_in_response(
+    core_settings: CoreSettings,
+) -> None:
+    client = QueueingClient(['{"issuedAt":"5.7.2026.","missing":null}'])
+    app = _app(core_settings, client)
+    schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                "issuedAt": {"type": "string", "format": "date"},
+                "missing": {"type": ["string", "null"]},
+            },
+            "required": ["issuedAt", "missing"],
+            "additionalProperties": False,
+        }
+    )
+
+    response = TestClient(app).post(
+        "/v1/parse",
+        headers={"X-API-Key": "valid-key"},
+        data={"schema": schema},
+        files={"file": ("sample.pdf", b"%PDF-1.4\ncontent", "application/pdf")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {"issuedAt": "2026-07-05", "missing": None}
+
+
 def test_parse_endpoint_forwards_models_field_to_client_request(
     core_settings: CoreSettings,
 ) -> None:

@@ -121,9 +121,16 @@ def build_chunk_plan(
             "additionalProperties": False,
         }
 
+    leading_data_lines = "\n".join(block.data_lines[: config.rows_per_chunk])
     summary_sections = [
         section
-        for section in (preamble, block.header_line, block.delimiter_line, footer)
+        for section in (
+            preamble,
+            block.header_line,
+            block.delimiter_line,
+            leading_data_lines,
+            footer,
+        )
         if section
     ]
     summary_markdown = "\n".join(summary_sections)

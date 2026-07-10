@@ -35,6 +35,7 @@ from api.platform.openrouter import OpenRouterRequest, OpenRouterResult
 from api.platform.schema import (
     evaluate_post_checks,
     format_validation_retry,
+    normalize_values,
     repair_json_output,
     validate_against_original,
 )
@@ -162,6 +163,7 @@ class DocumentParsingService:
             max_output_tokens=resolved.max_output_tokens,
         )
         data, result = await self._complete_and_validate(openrouter_request, request.schema)
+        data = normalize_values(data, request.schema)
 
         usage = UsageSummary(
             model=result.model,
@@ -308,6 +310,7 @@ class DocumentParsingService:
         validated = validate_against_original(assembled, request.schema)
         if not isinstance(validated, dict):
             raise SchemaError("Model output must be a JSON object")
+        validated = normalize_values(validated, request.schema)
 
         usage = _aggregate_usage(results, chunk_model)
         checks = _run_post_checks(validated, request.checks, request_id=request_id)
