@@ -121,3 +121,75 @@ def test_logging_settings_parse_environment_and_level_override(
 def test_logging_settings_reject_unknown_log_level(core_settings: CoreSettings) -> None:
     with pytest.raises(ValidationError):
         CoreSettings.model_validate({**core_settings.model_dump(), "log_level": "verbose"})
+
+
+def test_settings_parse_default_models_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CORE_OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setenv("CORE_DEFAULT_MODEL", "openai/gpt-5.2")
+    monkeypatch.setenv("CORE_DEFAULT_SYSTEM_PROMPT", "Extract facts.")
+    monkeypatch.setenv("CORE_TIMEOUT_SECONDS", "20")
+    monkeypatch.setenv("CORE_MAX_UPLOAD_BYTES", "4096")
+    monkeypatch.setenv(
+        "CORE_API_CONSUMERS",
+        '[{"id":"internal","api_key":"consumer-key","revoked":false}]',
+    )
+    monkeypatch.setenv(
+        "CORE_DEFAULT_MODELS",
+        '["openai/gpt-5.2","openai/gpt-5-mini"]',
+    )
+
+    settings = CoreSettings.from_env(env_file=None)
+
+    assert settings.default_models == ["openai/gpt-5.2", "openai/gpt-5-mini"]
+
+
+def test_resolve_request_overrides_uses_explicit_models_chain(
+    core_settings: CoreSettings,
+) -> None:
+    overrides = SafeRequestOverrides.model_validate({"models": ["a", "b"]})
+
+    resolved = resolve_request_overrides(core_settings, overrides)
+
+    assert resolved.models == ["a", "b"]
+    assert resolved.model == "a"
+
+
+def test_resolve_request_overrides_uses_explicit_single_model_without_fallback(
+    core_settings: CoreSettings,
+) -> None:
+    overrides = SafeRequestOverrides.model_validate({"model": "explicit-model"})
+
+    resolved = resolve_request_overrides(core_settings, overrides)
+
+    assert resolved.models == ["explicit-model"]
+    assert resolved.model == "explicit-model"
+
+
+def test_resolve_request_overrides_uses_settings_default_models_chain(
+    core_settings: CoreSettings,
+) -> None:
+    settings = core_settings.model_copy(update={"default_models": ["x", "y"]})
+
+    resolved = resolve_request_overrides(settings, None)
+
+    assert resolved.models == ["x", "y"]
+    assert resolved.model == "x"
+
+
+def test_resolve_request_overrides_falls_back_to_default_model(
+    core_settings: CoreSettings,
+) -> None:
+    resolved = resolve_request_overrides(core_settings, None)
+
+    assert resolved.models == [core_settings.default_model]
+    assert resolved.model == core_settings.default_model
+
+
+def test_resolve_request_overrides_dedups_and_caps_at_three(
+    core_settings: CoreSettings,
+) -> None:
+    overrides = SafeRequestOverrides.model_validate({"models": ["a", "a", "b", "c", "d"]})
+
+    resolved = resolve_request_overrides(core_settings, overrides)
+
+    assert resolved.models == ["a", "b", "c"]

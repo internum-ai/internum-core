@@ -35,8 +35,12 @@ class CoreSettings(InternumBaseSettings):
     environment: Literal["development", "production"] = "development"
     log_level: str | None = None
     default_model: str = Field(min_length=1)
+    default_models: list[str] | None = None
     default_system_prompt: str = Field(min_length=1)
     timeout_seconds: float = Field(gt=0)
+    request_attempt_timeout_seconds: float = Field(default=120.0, gt=0)
+    request_total_timeout_seconds: float = Field(default=300.0, gt=0)
+    stream_stall_timeout_seconds: float = Field(default=35.0, gt=0)
     max_upload_bytes: int = Field(gt=0)
     max_image_pixels: int = Field(default=25_000_000, gt=0)
     max_pdf_pages: int = Field(default=200, gt=0)
@@ -48,9 +52,16 @@ class CoreSettings(InternumBaseSettings):
     max_ooxml_compression_ratio: float = Field(default=100.0, gt=0)
     libreoffice_binary: str = Field(default="soffice", min_length=1)
     doc_conversion_timeout_seconds: float = Field(default=30.0, gt=0)
+    openrouter_provider_sort: Literal["price", "throughput", "latency"] | None = "throughput"
     default_reasoning_effort: Literal["minimal", "low", "medium", "high"] | None = None
     default_temperature: float | None = Field(default=None, ge=0, le=2)
     default_max_output_tokens: int | None = Field(default=None, gt=0)
+    chunk_row_threshold: int = Field(default=60, gt=0)
+    chunk_rows_per_chunk: int = Field(default=50, gt=0)
+    chunk_max_concurrency: int = Field(default=4, gt=0)
+    chunk_allow_partial: bool = True
+    chunk_model: str | None = None
+    chunk_prompt_cache: bool = True
     api_consumers: list[ApiConsumerSettings] = Field(min_length=1)
 
     @field_validator("default_model", "default_system_prompt", "libreoffice_binary")

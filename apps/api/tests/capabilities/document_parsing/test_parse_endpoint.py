@@ -15,6 +15,7 @@ from api.capabilities.document_parsing.models import (
     SupportedDocumentType,
 )
 from api.capabilities.document_parsing.service import DocumentParsingService
+from api.common.errors import SchemaError
 from api.common.logging import configure_logging
 from api.config.overrides import SafeRequestOverrides
 from api.config.settings import CoreSettings
@@ -125,11 +126,33 @@ def test_parse_endpoint_returns_schema_validated_json_with_nulls(
                 "costUsd": "0",
             },
             "checks": [],
+            "chunking": None,
         },
     }
     assert client.requests[0].model == "anthropic/claude-sonnet-4.5"
     assert client.requests[0].system_prompt == "Return JSON only."
     assert "Use the document title." in client.requests[0].user_content
+
+
+def test_parse_endpoint_forwards_models_field_to_client_request(
+    core_settings: CoreSettings,
+) -> None:
+    client = QueueingClient(['{"name":"Ada","missing":null}'])
+    app = _app(core_settings, client)
+
+    response = TestClient(app).post(
+        "/v1/parse",
+        headers={"X-API-Key": "valid-key"},
+        data={
+            "schema": _schema(),
+            "models": json.dumps(["openai/gpt-5.2", "openai/gpt-5-mini"]),
+        },
+        files={"file": ("sample.pdf", b"%PDF-1.4\ncontent", "application/pdf")},
+    )
+
+    assert response.status_code == 200
+    assert client.requests[0].models == ["openai/gpt-5.2", "openai/gpt-5-mini"]
+    assert client.requests[0].model == "openai/gpt-5.2"
 
 
 def test_parse_endpoint_retries_once_after_schema_validation_failure(
@@ -164,6 +187,7 @@ def test_parse_endpoint_retries_once_after_schema_validation_failure(
                 "costUsd": "0",
             },
             "checks": [],
+            "chunking": None,
         },
     }
     assert len(client.requests) == 2
@@ -372,6 +396,286 @@ def _app(core_settings: CoreSettings, client: QueueingClient):
     app.state.document_extractor = Extractor()
     app.state.openrouter_client = client
     return app
+
+
+def _table_markdown(row_count: int) -> str:
+    header = "| id | amount |"
+    delimiter = "| --- | --- |"
+    rows = [f"| {index} | {index * 10} |" for index in range(row_count)]
+    return "\n".join([header, delimiter, *rows])
+
+
+def _row_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "rows": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "amount": {"type": "number"},
+                    },
+                    "required": ["id", "amount"],
+                    "additionalProperties": False,
+                },
+            },
+            "grandTotal": {"type": "number"},
+        },
+        "required": ["rows", "grandTotal"],
+        "additionalProperties": False,
+    }
+
+
+class TableExtractor:
+    def __init__(self, row_count: int) -> None:
+        self._row_count = row_count
+
+    async def extract(self, upload):  # type: ignore[no-untyped-def]
+        return ExtractedDocument(
+            markdown=_table_markdown(self._row_count),
+            metadata=ParseMetadata(
+                document_type=upload.document_type,
+                extraction_mode=None,
+                page_count=None,
+                ocr_page_count=None,
+                converter="markitdown",
+            ),
+        )
+
+
+def _parse_pipe_row(line: str) -> tuple[int, int]:
+    cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+    return int(cells[0]), int(cells[1])
+
+
+class DerivingChunkClient:
+    """Fake OpenRouter completer that derives its response from each request's
+    schema/markdown so it works regardless of concurrency ordering."""
+
+    def __init__(self, *, fail_row_id: int | None = None) -> None:
+        self.requests = []
+        self._fail_row_id = fail_row_id
+        self._fail_attempts: dict[int, int] = {}
+        self.in_flight = 0
+        self.max_in_flight = 0
+
+    async def complete(self, request):  # type: ignore[no-untyped-def]
+        self.requests.append(request)
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            await asyncio.sleep(0.01)
+            properties = request.schema.get("properties", {})
+            if "rows" in properties:
+                lines = [line for line in request.user_content.splitlines() if line.startswith("|")]
+                data_lines = lines[2:]
+                rows = []
+                for line in data_lines:
+                    row_id, amount = _parse_pipe_row(line)
+                    if self._fail_row_id is not None and row_id == self._fail_row_id:
+                        attempts = self._fail_attempts.get(row_id, 0) + 1
+                        self._fail_attempts[row_id] = attempts
+                        raise SchemaError("simulated persistent chunk failure")
+                    rows.append({"id": row_id, "amount": amount})
+                content = json.dumps({"rows": rows})
+            else:
+                content = json.dumps({"grandTotal": 0})
+            return OpenRouterResult(
+                content=content,
+                model=request.model,
+                provider="openai",
+                prompt_tokens=1,
+                completion_tokens=1,
+                total_tokens=2,
+                cost_usd=Decimal("0"),
+            )
+        finally:
+            self.in_flight -= 1
+
+
+def test_parse_endpoint_below_threshold_document_stays_single_pass(
+    core_settings: CoreSettings,
+) -> None:
+    client = QueueingClient(['{"name":"Ada","missing":null}'])
+    app = _app(core_settings, client)
+
+    response = TestClient(app).post(
+        "/v1/parse",
+        headers={"X-API-Key": "valid-key"},
+        data={"schema": _schema()},
+        files={"file": ("sample.pdf", b"%PDF-1.4\ncontent", "application/pdf")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["meta"]["chunking"] is None
+    assert len(client.requests) == 1
+
+
+def test_parse_endpoint_chunks_large_tabular_document(
+    core_settings: CoreSettings,
+) -> None:
+    settings = core_settings.model_copy(
+        update={"chunk_row_threshold": 10, "chunk_rows_per_chunk": 20}
+    )
+    client = DerivingChunkClient()
+    app = create_app(settings=settings)
+    app.state.document_extractor = TableExtractor(60)
+    app.state.openrouter_client = client
+
+    response = TestClient(app).post(
+        "/v1/parse",
+        headers={"X-API-Key": "valid-key"},
+        data={"schema": json.dumps(_row_schema())},
+        files={"file": ("sample.pdf", b"%PDF-1.4\ncontent", "application/pdf")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    ids = [row["id"] for row in body["data"]["rows"]]
+    assert ids == list(range(60))
+
+    chunk_requests = [
+        request for request in client.requests if "rows" in request.schema["properties"]
+    ]
+    for request in chunk_requests:
+        assert set(request.schema["properties"]) == {"rows"}
+
+    summary_requests = [
+        request for request in client.requests if "grandTotal" in request.schema["properties"]
+    ]
+    assert len(summary_requests) == 1
+    assert set(summary_requests[0].schema["properties"]) == {"grandTotal"}
+
+    chunking = body["meta"]["chunking"]
+    assert chunking["chunked"] is True
+    assert chunking["totalRows"] == 60
+    assert chunking["chunkCount"] == 3
+    assert chunking["partial"] is False
+    assert chunking["failedChunks"] == []
+
+
+def test_parse_endpoint_runs_post_check_over_merged_chunk_rows(
+    core_settings: CoreSettings,
+) -> None:
+    settings = core_settings.model_copy(
+        update={"chunk_row_threshold": 10, "chunk_rows_per_chunk": 20}
+    )
+    client = DerivingChunkClient()
+    app = create_app(settings=settings)
+    app.state.document_extractor = TableExtractor(30)
+    app.state.openrouter_client = client
+
+    expected_total = sum(index * 10 for index in range(30))
+    response = TestClient(app).post(
+        "/v1/parse",
+        headers={"X-API-Key": "valid-key"},
+        data={
+            "schema": json.dumps(_row_schema()),
+            "checks": json.dumps(
+                [
+                    {
+                        "op": "sum_equals",
+                        "addends": [f"/rows/{index}/amount" for index in range(30)],
+                        "total": "/grandTotal",
+                        "tolerance": 0,
+                    }
+                ]
+            ),
+        },
+        files={"file": ("sample.pdf", b"%PDF-1.4\ncontent", "application/pdf")},
+    )
+
+    assert response.status_code == 200
+    checks = response.json()["meta"]["checks"]
+    assert len(checks) == 1
+    assert checks[0]["op"] == "sum_equals"
+    # The fake summary pass always returns grandTotal=0, so the sum-check fails,
+    # signalling the gap between the merged rows and the reported total.
+    assert checks[0]["passed"] is (expected_total == 0)
+
+
+def test_parse_endpoint_bounds_chunk_concurrency(
+    core_settings: CoreSettings,
+) -> None:
+    settings = core_settings.model_copy(
+        update={
+            "chunk_row_threshold": 10,
+            "chunk_rows_per_chunk": 5,
+            "chunk_max_concurrency": 2,
+        }
+    )
+    client = DerivingChunkClient()
+    app = create_app(settings=settings)
+    app.state.document_extractor = TableExtractor(50)
+    app.state.openrouter_client = client
+
+    response = TestClient(app).post(
+        "/v1/parse",
+        headers={"X-API-Key": "valid-key"},
+        data={"schema": json.dumps(_row_schema())},
+        files={"file": ("sample.pdf", b"%PDF-1.4\ncontent", "application/pdf")},
+    )
+
+    assert response.status_code == 200
+    assert client.max_in_flight <= 2
+
+
+def test_parse_endpoint_reports_partial_chunking_on_persistent_chunk_failure(
+    core_settings: CoreSettings,
+) -> None:
+    settings = core_settings.model_copy(
+        update={"chunk_row_threshold": 10, "chunk_rows_per_chunk": 20}
+    )
+    client = DerivingChunkClient(fail_row_id=25)
+    app = create_app(settings=settings)
+    app.state.document_extractor = TableExtractor(60)
+    app.state.openrouter_client = client
+
+    response = TestClient(app).post(
+        "/v1/parse",
+        headers={"X-API-Key": "valid-key"},
+        data={"schema": json.dumps(_row_schema())},
+        files={"file": ("sample.pdf", b"%PDF-1.4\ncontent", "application/pdf")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    chunking = body["meta"]["chunking"]
+    assert chunking["partial"] is True
+    assert chunking["failedChunks"] == [1]
+    ids = [row["id"] for row in body["data"]["rows"]]
+    assert 25 not in ids
+    assert 0 in ids
+    assert 59 in ids
+
+
+def test_parse_endpoint_fails_whole_document_when_partial_not_allowed(
+    core_settings: CoreSettings,
+) -> None:
+    settings = core_settings.model_copy(
+        update={
+            "chunk_row_threshold": 10,
+            "chunk_rows_per_chunk": 20,
+            "chunk_allow_partial": False,
+        }
+    )
+    client = DerivingChunkClient(fail_row_id=25)
+    app = create_app(settings=settings)
+    app.state.document_extractor = TableExtractor(60)
+    app.state.openrouter_client = client
+
+    response = TestClient(app).post(
+        "/v1/parse",
+        headers={"X-API-Key": "valid-key"},
+        data={"schema": json.dumps(_row_schema())},
+        files={"file": ("sample.pdf", b"%PDF-1.4\ncontent", "application/pdf")},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "schema_error"
+    assert response.json()["error"]["details"]["failedChunks"] == [1]
 
 
 class BlockingClient:

@@ -21,6 +21,7 @@ class OpenRouterRequest:
     user_content: str
     schema: dict[str, Any]
     capability: str
+    models: list[str] | None = None
     consumer_id: str | None = None
     request_id: str | None = None
     images: list[ImageInput] = field(default_factory=list)
@@ -29,6 +30,7 @@ class OpenRouterRequest:
     reasoning_effort: str | None = None
     temperature: float | None = None
     max_output_tokens: int | None = None
+    cache_control: bool = False
 
 
 @dataclass(frozen=True)

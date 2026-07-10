@@ -110,6 +110,7 @@ async def test_pdf_preflight_reports_native_metadata(
         "converter": "pymupdf",
         "usage": None,
         "checks": [],
+        "chunking": None,
     }
 
 

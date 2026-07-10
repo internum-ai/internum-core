@@ -91,6 +91,57 @@ class PostCheckResult:
 
 
 @dataclass(frozen=True)
+class RowArrayLocation:
+    property_name: str
+    item_schema: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class DocumentChunk:
+    index: int
+    start_row: int
+    end_row: int
+    markdown: str
+
+
+@dataclass(frozen=True)
+class ChunkPlan:
+    array_location: RowArrayLocation
+    chunk_schema: dict[str, Any]
+    summary_schema: dict[str, Any] | None
+    summary_markdown: str
+    chunks: list[DocumentChunk]
+    total_rows: int
+
+
+@dataclass(frozen=True)
+class ChunkOutcome:
+    index: int
+    rows: list[Any] | None
+    error: str | None
+
+
+@dataclass(frozen=True)
+class ChunkingSummary:
+    chunked: bool
+    total_rows: int
+    chunk_count: int
+    failed_chunks: list[int]
+    partial: bool
+    model: str
+
+    def to_api(self) -> dict[str, Any]:
+        return {
+            "chunked": self.chunked,
+            "totalRows": self.total_rows,
+            "chunkCount": self.chunk_count,
+            "failedChunks": self.failed_chunks,
+            "partial": self.partial,
+            "model": self.model,
+        }
+
+
+@dataclass(frozen=True)
 class ParseMetadata:
     document_type: SupportedDocumentType
     extraction_mode: ExtractionMode | None
@@ -99,6 +150,7 @@ class ParseMetadata:
     converter: str | None
     usage: UsageSummary | None = None
     checks: list[PostCheckResult] = field(default_factory=list)
+    chunking: ChunkingSummary | None = None
 
     def to_api(self) -> dict[str, Any]:
         return {
@@ -109,6 +161,7 @@ class ParseMetadata:
             "converter": self.converter,
             "usage": self.usage.to_api() if self.usage else None,
             "checks": [check.to_api() for check in self.checks],
+            "chunking": self.chunking.to_api() if self.chunking else None,
         }
 
 

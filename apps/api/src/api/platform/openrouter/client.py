@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import random
 import time
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -15,6 +16,7 @@ from api.platform.schema.normalize import normalize_for_model
 
 from .models import ImageInput, OpenRouterRequest, OpenRouterResult
 from .openai_compat import OPENROUTER_BASE_URL
+from .streaming import consume_completion_stream
 
 RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
@@ -38,6 +40,7 @@ class OpenRouterClient:
         self._backoff_seconds = backoff_seconds
 
     async def complete(self, request: OpenRouterRequest) -> OpenRouterResult:
+        deadline = time.monotonic() + self._settings.request_total_timeout_seconds
         start_attempt = max(1, request.attempt)
         native_payload = self._build_payload(request, native_structured=True)
         try:
@@ -46,6 +49,7 @@ class OpenRouterClient:
                 request,
                 structured_mode="native",
                 start_attempt=start_attempt,
+                deadline=deadline,
             )
         except UpstreamError as exc:
             if not _is_native_schema_rejection(exc):
@@ -66,6 +70,7 @@ class OpenRouterClient:
             request,
             structured_mode="fallback",
             start_attempt=fallback_attempt,
+            deadline=deadline,
         )
 
     def _build_payload(
@@ -75,17 +80,31 @@ class OpenRouterClient:
         native_structured: bool,
     ) -> dict[str, Any]:
         user_content = _build_user_content(request.user_content, request.images)
+        system_content: str | list[dict[str, Any]] = request.system_prompt
+        if request.cache_control:
+            system_content = [
+                {
+                    "type": "text",
+                    "text": request.system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": request.system_prompt},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": user_content},
         ]
         if request.validation_retry_prompt is not None:
             messages.append({"role": "user", "content": request.validation_retry_prompt})
 
         payload: dict[str, Any] = {
-            "model": request.model,
             "messages": messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
         }
+        if request.models:
+            payload["models"] = request.models
+        else:
+            payload["model"] = request.model
 
         if request.reasoning_effort is not None:
             payload["reasoning"] = {"effort": request.reasoning_effort}
@@ -94,8 +113,13 @@ class OpenRouterClient:
         if request.max_output_tokens is not None:
             payload["max_tokens"] = request.max_output_tokens
 
+        provider_sort = self._settings.openrouter_provider_sort
+
         if native_structured:
-            payload["provider"] = {"require_parameters": True}
+            provider: dict[str, Any] = {"require_parameters": True}
+            if provider_sort is not None:
+                provider["sort"] = provider_sort
+            payload["provider"] = provider
             payload["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {
@@ -105,6 +129,8 @@ class OpenRouterClient:
                 },
             }
         else:
+            if provider_sort is not None:
+                payload["provider"] = {"sort": provider_sort}
             payload["messages"].append(
                 {
                     "role": "user",
@@ -125,10 +151,22 @@ class OpenRouterClient:
         *,
         structured_mode: str,
         start_attempt: int,
+        deadline: float,
     ) -> OpenRouterResult:
         last_error: UpstreamError | None = None
-        for retry_offset in range(self._max_retries + 1):
+        retry_offset = 0
+        while True:
             attempt_number = start_attempt + retry_offset
+            remaining = remaining_budget(deadline)
+            if remaining <= 0:
+                raise last_error or UpstreamError(
+                    "OpenRouter request exceeded its total time budget",
+                    attempt=attempt_number,
+                )
+            attempt_timeout = effective_attempt_timeout(
+                remaining, self._settings.request_attempt_timeout_seconds
+            )
+
             log_event(
                 "model.request",
                 model=request.model,
@@ -138,146 +176,166 @@ class OpenRouterClient:
             )
             started_at = time.perf_counter()
             try:
-                async with httpx.AsyncClient(
-                    base_url=self._base_url,
-                    timeout=self._settings.timeout_seconds,
-                    transport=self._transport,
-                ) as client:
-                    response = await client.post(
-                        "/chat/completions",
-                        headers={
-                            "Authorization": (
-                                f"Bearer {self._settings.openrouter_api_key.get_secret_value()}"
-                            ),
-                            "Content-Type": "application/json",
-                        },
-                        json=payload,
-                    )
-            except httpx.RequestError as exc:
-                error = UpstreamError("OpenRouter request failed", attempt=attempt_number)
-                self._log_failed_response(
+                result = await self._attempt(
+                    payload,
                     request,
-                    attempt=attempt_number,
-                    started_at=started_at,
                     structured_mode=structured_mode,
-                    error=error,
+                    attempt_number=attempt_number,
+                    attempt_timeout=attempt_timeout,
+                    started_at=started_at,
                 )
-                if retry_offset >= self._max_retries:
-                    raise error from exc
+            except _RetryableAttemptError as retryable:
+                error = retryable.error
+                last_error = error
+                remaining = remaining_budget(deadline)
+                backoff = None
+                if retry_offset < self._max_retries:
+                    backoff = backoff_with_jitter(self._backoff_seconds, retry_offset, remaining)
+                if backoff is None:
+                    raise error from retryable.__cause__
                 next_attempt = attempt_number + 1
                 log_event(
                     "model.retry",
                     level=logging.WARNING,
-                    reason="network_error",
+                    reason=retryable.reason,
                     attempt=next_attempt,
+                    statusCode=retryable.status_code,
                     model=request.model,
                     requestId=request.request_id,
                 )
-                last_error = error
-                await asyncio.sleep(self._backoff_seconds * (2**retry_offset))
+                await asyncio.sleep(backoff)
+                retry_offset += 1
                 continue
 
-            if response.status_code < 400:
-                try:
-                    result = self._parse_success_response(
-                        _json_response(response),
-                        request,
-                        attempt=attempt_number,
-                    )
-                except UpstreamError as exc:
-                    exc.attempt = attempt_number
-                    self._log_failed_response(
-                        request,
-                        attempt=attempt_number,
-                        started_at=started_at,
-                        structured_mode=structured_mode,
-                        error=exc,
-                        status_code=response.status_code,
-                    )
-                    raise
-                self._record_usage(result, request)
-                duration_ms = _duration_ms(started_at)
-                log_event(
-                    "model.response",
-                    outcome="succeeded",
-                    attempt=attempt_number,
-                    structuredMode=structured_mode,
-                    model=result.model,
-                    provider=result.provider,
-                    promptTokens=result.prompt_tokens,
-                    completionTokens=result.completion_tokens,
-                    totalTokens=result.total_tokens,
-                    costUsd=result.cost_usd,
-                    latencyMs=duration_ms,
-                    durationMs=duration_ms,
-                    requestId=request.request_id,
-                )
-                return result
+            self._record_usage(result, request)
+            duration_ms = _duration_ms(started_at)
+            log_event(
+                "model.response",
+                outcome="succeeded",
+                attempt=attempt_number,
+                structuredMode=structured_mode,
+                model=result.model,
+                provider=result.provider,
+                promptTokens=result.prompt_tokens,
+                completionTokens=result.completion_tokens,
+                totalTokens=result.total_tokens,
+                costUsd=result.cost_usd,
+                latencyMs=duration_ms,
+                durationMs=duration_ms,
+                requestId=request.request_id,
+            )
+            return result
 
-            last_error = _map_error_response(response)
-            last_error.attempt = attempt_number
+    async def _attempt(
+        self,
+        payload: dict[str, Any],
+        request: OpenRouterRequest,
+        *,
+        structured_mode: str,
+        attempt_number: int,
+        attempt_timeout: float,
+        started_at: float,
+    ) -> OpenRouterResult:
+        try:
+            return await asyncio.wait_for(
+                self._run_attempt(payload, request, attempt_number=attempt_number),
+                timeout=attempt_timeout,
+            )
+        except TimeoutError as exc:
+            error = UpstreamError(
+                "OpenRouter attempt exceeded its time budget", attempt=attempt_number
+            )
             self._log_failed_response(
                 request,
                 attempt=attempt_number,
                 started_at=started_at,
                 structured_mode=structured_mode,
-                error=last_error,
-                status_code=response.status_code,
+                error=error,
             )
-            if (
-                response.status_code not in RETRYABLE_STATUS_CODES
-                or retry_offset >= self._max_retries
-            ):
-                raise last_error
-            next_attempt = attempt_number + 1
-            log_event(
-                "model.retry",
-                level=logging.WARNING,
-                reason="retryable_status",
-                attempt=next_attempt,
-                statusCode=response.status_code,
-                model=request.model,
-                requestId=request.request_id,
+            raise _RetryableAttemptError(error, reason="deadline_exceeded") from exc
+        except httpx.RequestError as exc:
+            error = UpstreamError("OpenRouter request failed", attempt=attempt_number)
+            self._log_failed_response(
+                request,
+                attempt=attempt_number,
+                started_at=started_at,
+                structured_mode=structured_mode,
+                error=error,
             )
-            await asyncio.sleep(self._backoff_seconds * (2**retry_offset))
+            raise _RetryableAttemptError(error, reason="network_error") from exc
+        except _MappedStatusError as exc:
+            error = exc.error
+            error.attempt = attempt_number
+            self._log_failed_response(
+                request,
+                attempt=attempt_number,
+                started_at=started_at,
+                structured_mode=structured_mode,
+                error=error,
+                status_code=exc.status_code,
+            )
+            if exc.status_code not in RETRYABLE_STATUS_CODES:
+                raise error from exc
+            raise _RetryableAttemptError(
+                error, reason="retryable_status", status_code=exc.status_code
+            ) from exc
+        except UpstreamError as exc:
+            exc.attempt = attempt_number
+            self._log_failed_response(
+                request,
+                attempt=attempt_number,
+                started_at=started_at,
+                structured_mode=structured_mode,
+                error=exc,
+            )
+            raise
 
-        raise last_error or UpstreamError()
-
-    def _parse_success_response(
+    async def _run_attempt(
         self,
-        data: dict[str, Any],
+        payload: dict[str, Any],
         request: OpenRouterRequest,
         *,
-        attempt: int,
+        attempt_number: int,
     ) -> OpenRouterResult:
-        choices = data.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise UpstreamError("OpenRouter response did not include choices")
+        async with httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=httpx.Timeout(
+                connect=self._settings.timeout_seconds,
+                read=self._settings.stream_stall_timeout_seconds,
+                write=self._settings.timeout_seconds,
+                pool=self._settings.timeout_seconds,
+            ),
+            transport=self._transport,
+        ) as client:
+            async with client.stream(
+                "POST",
+                "/chat/completions",
+                headers={
+                    "Authorization": (
+                        f"Bearer {self._settings.openrouter_api_key.get_secret_value()}"
+                    ),
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            ) as response:
+                if response.status_code >= 400:
+                    await response.aread()
+                    raise _MappedStatusError(
+                        _map_error_response(response), status_code=response.status_code
+                    )
+                assembly = await consume_completion_stream(response)
 
-        choice = choices[0]
-        if not isinstance(choice, dict):
-            raise UpstreamError("OpenRouter response choice was malformed")
-        if choice.get("error"):
-            raise UpstreamError("OpenRouter provider returned an error")
-
-        message = choice.get("message")
-        content = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(content, str):
-            raise UpstreamError("OpenRouter response did not include text content")
-
-        usage_data = data.get("usage")
-        usage = usage_data if isinstance(usage_data, dict) else {}
-        result = OpenRouterResult(
-            content=content,
-            model=str(data.get("model") or request.model),
-            provider=str(data["provider"]) if data.get("provider") is not None else None,
+        usage = assembly.usage or {}
+        return OpenRouterResult(
+            content=assembly.content,
+            model=str(assembly.model or request.model),
+            provider=assembly.provider,
             prompt_tokens=_int_usage(usage.get("prompt_tokens")),
             completion_tokens=_int_usage(usage.get("completion_tokens")),
             total_tokens=_int_usage(usage.get("total_tokens")),
             cost_usd=_decimal_usage_cost(usage.get("cost")),
-            attempt=attempt,
+            attempt=attempt_number,
         )
-        return result
 
     def _log_failed_response(
         self,
@@ -331,6 +389,38 @@ class OpenRouterClient:
         )
 
 
+class _RetryableAttemptError(Exception):
+    def __init__(
+        self, error: UpstreamError, *, reason: str, status_code: int | None = None
+    ) -> None:
+        self.error = error
+        self.reason = reason
+        self.status_code = status_code
+        super().__init__(error.message)
+
+
+class _MappedStatusError(Exception):
+    def __init__(self, error: UpstreamError, *, status_code: int) -> None:
+        self.error = error
+        self.status_code = status_code
+        super().__init__(error.message)
+
+
+def remaining_budget(deadline: float) -> float:
+    return deadline - time.monotonic()
+
+
+def effective_attempt_timeout(remaining: float, cap: float) -> float:
+    return min(cap, remaining)
+
+
+def backoff_with_jitter(base: float, offset: int, remaining: float) -> float | None:
+    nominal = base * (2**offset)
+    if nominal >= remaining:
+        return None
+    return random.uniform(0, nominal)
+
+
 def _build_user_content(text: str, images: list[ImageInput]) -> str | list[dict[str, Any]]:
     if not images:
         return text
@@ -357,16 +447,6 @@ def _map_error_response(response: httpx.Response) -> UpstreamError:
     if isinstance(error, dict) and isinstance(error.get("message"), str):
         message = error["message"]
     return UpstreamError(message)
-
-
-def _json_response(response: httpx.Response) -> dict[str, Any]:
-    try:
-        data = response.json()
-    except ValueError as exc:
-        raise UpstreamError("OpenRouter response was not valid JSON") from exc
-    if not isinstance(data, dict):
-        raise UpstreamError("OpenRouter response JSON was malformed")
-    return data
 
 
 def _is_native_schema_rejection(error: UpstreamError) -> bool:

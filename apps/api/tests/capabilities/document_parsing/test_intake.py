@@ -1,4 +1,5 @@
 import json
+import struct
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -7,8 +8,18 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from api.capabilities.document_parsing.intake import detect_document_type
+from api.capabilities.document_parsing.models import SupportedDocumentType
 from api.config.settings import CoreSettings
 from api.main import create_app
+
+
+def _ole_with_stray_zip_eocd() -> bytes:
+    """A legacy OLE-CFB (.xls) payload that also contains a stray zip End-of-Central-Directory
+    marker, so ``zipfile.is_zipfile`` returns True even though the file is not an OOXML zip."""
+    ole_signature = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+    empty_eocd = b"PK\x05\x06" + struct.pack("<HHHHIIH", 0, 0, 0, 0, 0, 0, 0)
+    return ole_signature + b"\x00" * 128 + b"BIFF-worksheet-bytes" + empty_eocd
 
 
 def _schema() -> str:
@@ -82,6 +93,7 @@ def test_valid_docx_intake_reaches_parser_and_cleans_temp_file(
                 "costUsd": "0",
             },
             "checks": [],
+            "chunking": None,
         },
     }
     assert captured_paths
@@ -164,6 +176,44 @@ def test_new_supported_suffixes_reach_parser(
     assert response.status_code == 200
     assert captured_types == [expected_type]
     assert response.json()["meta"]["documentType"] == expected_type
+
+
+def test_detect_document_type_prefers_ole_over_stray_zip_marker(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.xls"
+    path.write_bytes(_ole_with_stray_zip_eocd())
+
+    assert zipfile.is_zipfile(path) is True
+    document_type, _ = detect_document_type(path)
+
+    assert document_type is SupportedDocumentType.XLS
+
+
+def test_legacy_xls_with_stray_zip_marker_reaches_parser(core_settings: CoreSettings) -> None:
+    app = create_app(settings=core_settings)
+    captured_types: list[str] = []
+
+    class Extractor:
+        async def extract(self, upload):  # type: ignore[no-untyped-def]
+            captured_types.append(upload.document_type.value)
+            return "Name: Ada"
+
+    class Client:
+        async def complete(self, request):  # type: ignore[no-untyped-def]
+            return _result('{"name":"Ada"}')
+
+    app.state.document_extractor = Extractor()
+    app.state.openrouter_client = Client()
+
+    response = TestClient(app).post(
+        "/v1/parse",
+        headers={"X-API-Key": "valid-key"},
+        data={"schema": _schema()},
+        files={"file": ("legacy.xls", _ole_with_stray_zip_eocd(), "application/octet-stream")},
+    )
+
+    assert response.status_code == 200
+    assert captured_types == ["xls"]
+    assert response.json()["meta"]["documentType"] == "xls"
 
 
 def test_invalid_schema_after_upload_parse_closes_temp_file(core_settings: CoreSettings) -> None:

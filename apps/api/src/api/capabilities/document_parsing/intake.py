@@ -167,6 +167,12 @@ def detect_document_type(
         return SupportedDocumentType.PNG, detected_mime
     if header.startswith(b"\xff\xd8\xff"):
         return SupportedDocumentType.JPEG, detected_mime
+    # Legacy OLE-CFB (.doc/.xls) is a leading-magic format and must be matched before the
+    # is_zipfile() whole-file scan: that scan finds the End-of-Central-Directory marker
+    # (PK\x05\x06) which appears coincidentally inside OLE containers, misrouting a genuine
+    # .xls into the OOXML zip path where it is wrongly rejected as unsupported.
+    if header.startswith(OLE_CFB_SIGNATURE):
+        return _detect_legacy_office_type(suffix, detected_mime), detected_mime
     if zipfile.is_zipfile(path):
         return (
             _detect_office_zip(
@@ -179,8 +185,6 @@ def detect_document_type(
         )
     if _looks_like_html(header) and suffix in {".html", ".htm"}:
         return SupportedDocumentType.HTML, detected_mime
-    if header.startswith(OLE_CFB_SIGNATURE):
-        return _detect_legacy_office_type(suffix, detected_mime), detected_mime
 
     raise IntakeError("Unsupported file type", code="unsupported_file_type")
 
@@ -252,7 +256,7 @@ async def _parse_limited_multipart_form(
         Headers(raw=request.headers.raw),
         _limited_body_stream(request, max_body_bytes=_max_body_bytes(max_upload_bytes)),
         max_files=1,
-        max_fields=5,
+        max_fields=6,
         max_part_size=FORM_FIELD_LIMIT_BYTES,
     )
     return await parser.parse()
@@ -308,16 +312,30 @@ def _extract_checks(form: FormData) -> list[dict[str, Any]]:
 
 
 def _extract_overrides(form: FormData) -> SafeRequestOverrides:
+    fields: dict[str, Any] = {
+        key: value
+        for key in ("model", "systemPrompt")
+        if (value := _optional_text(form, key)) is not None
+    }
+    raw_models = _optional_text(form, "models")
+    if raw_models is not None:
+        fields["models"] = _parse_models_field(raw_models)
+
     try:
-        return SafeRequestOverrides.model_validate(
-            {
-                key: value
-                for key in ("model", "systemPrompt")
-                if (value := _optional_text(form, key)) is not None
-            }
-        )
+        return SafeRequestOverrides.model_validate(fields)
     except ValidationError as exc:
         raise IntakeError("Request overrides are invalid") from exc
+
+
+def _parse_models_field(raw_models: str) -> list[str]:
+    try:
+        models = json.loads(raw_models)
+    except json.JSONDecodeError as exc:
+        raise IntakeError("Request overrides are invalid") from exc
+
+    if not isinstance(models, list) or not all(isinstance(item, str) for item in models):
+        raise IntakeError("Request overrides are invalid")
+    return models
 
 
 def _required_text(form: FormData, key: str) -> str:
