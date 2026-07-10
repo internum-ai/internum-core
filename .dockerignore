@@ -1,0 +1,48 @@
+# Version control
+.git
+.gitignore
+
+# Environment files - never leak secrets into the build context
+.env
+.env*
+**/.env
+**/.env*
+
+# Python / uv virtual environments and caches
+.venv
+**/.venv
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.deptry
+
+# Build/dist artifacts (rebuilt fresh inside the image)
+dist/
+build/
+**/dist/
+**/build/
+*.egg-info
+**/*.egg-info
+
+# Editor / OS cruft
+.idea
+.vscode
+.DS_Store
+
+# Docs and misc project notes (not needed to build or run the service)
+*.md
+testing-documents/
+
+# Test suites (not needed to build the runtime image)
+apps/api/tests
+packages/config/tests
+packages/shared/tests
+
+# Local tooling not required by the container build
+scripts/
+justfile
+lefthook.yml
