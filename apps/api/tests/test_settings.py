@@ -95,3 +95,29 @@ def test_duplicate_consumer_ids_fail_validation() -> None:
                 ApiConsumerSettings(id="internal", api_key="two"),
             ],
         )
+
+
+def test_logging_settings_parse_environment_and_level_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CORE_OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setenv("CORE_DEFAULT_MODEL", "openai/gpt-5.2")
+    monkeypatch.setenv("CORE_DEFAULT_SYSTEM_PROMPT", "Extract facts.")
+    monkeypatch.setenv("CORE_TIMEOUT_SECONDS", "20")
+    monkeypatch.setenv("CORE_MAX_UPLOAD_BYTES", "4096")
+    monkeypatch.setenv(
+        "CORE_API_CONSUMERS",
+        '[{"id":"internal","api_key":"consumer-key","revoked":false}]',
+    )
+    monkeypatch.setenv("CORE_ENVIRONMENT", "production")
+    monkeypatch.setenv("CORE_LOG_LEVEL", "warning")
+
+    settings = CoreSettings.from_env(env_file=None)
+
+    assert settings.environment == "production"
+    assert settings.log_level == "WARNING"
+
+
+def test_logging_settings_reject_unknown_log_level(core_settings: CoreSettings) -> None:
+    with pytest.raises(ValidationError):
+        CoreSettings.model_validate({**core_settings.model_dump(), "log_level": "verbose"})

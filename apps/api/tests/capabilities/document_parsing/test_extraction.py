@@ -1,3 +1,4 @@
+import json
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,7 @@ from api.capabilities.document_parsing.extraction import (
 )
 from api.capabilities.document_parsing.models import StoredUpload, SupportedDocumentType
 from api.common.errors import IntakeError
+from api.common.logging import configure_logging
 from api.config.settings import CoreSettings
 from api.platform.openrouter import OPENROUTER_BASE_URL
 
@@ -122,6 +124,40 @@ async def test_pdf_preflight_reports_native_metadata(
 
 
 @pytest.mark.anyio
+async def test_extraction_logs_pdf_preflight_and_markitdown_debug_output(
+    core_settings: CoreSettings,
+    tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    configure_logging(environment="production", log_level="DEBUG")
+
+    @dataclass
+    class Result:
+        text_content: str
+
+    class Converter:
+        def convert_local(self, path: str | Path, **kwargs: object) -> Result:
+            return Result(text_content="# Private markdown")
+
+    upload_path = _native_pdf(tmp_path / "native-logged.pdf")
+    await MarkItDownExtractor(Converter(), core_settings).extract(
+        _upload(upload_path, SupportedDocumentType.PDF)
+    )
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    by_name = {event["event"]: event for event in events}
+    assert by_name["pdf.preflight"]["pageCount"] == 1
+    assert by_name["pdf.preflight"]["nativeTextPages"] == 1
+    assert by_name["pdf.preflight"]["scanLikePages"] == 0
+    assert by_name["pdf.preflight"]["extractionMode"] == "native"
+    assert by_name["pdf.preflight"]["durationMs"] >= 0
+    assert by_name["markitdown.convert"]["extension"] == ".pdf"
+    assert by_name["markitdown.convert"]["markdownLength"] == 18
+    assert by_name["markitdown.convert"]["durationMs"] >= 0
+    assert by_name["markitdown.output"]["markdown"] == "# Private markdown"
+
+
+@pytest.mark.anyio
 async def test_pdf_preflight_reports_scan_metadata(
     core_settings: CoreSettings,
     tmp_path: Path,
@@ -170,7 +206,9 @@ async def test_pdf_preflight_reports_mixed_metadata(
 async def test_pdf_over_page_limit_returns_stable_error(
     core_settings: CoreSettings,
     tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
 ) -> None:
+    configure_logging(environment="production", log_level="INFO")
     settings = core_settings.model_copy(update={"max_pdf_pages": 1})
     upload_path = _two_page_pdf(tmp_path / "large.pdf")
 
@@ -180,6 +218,11 @@ async def test_pdf_over_page_limit_returns_stable_error(
         )
 
     assert exc_info.value.code == "pdf_page_limit_exceeded"
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    preflight = next(event for event in events if event["event"] == "pdf.preflight")
+    assert preflight["outcome"] == "rejected"
+    assert preflight["errorCode"] == "pdf_page_limit_exceeded"
+    assert preflight["durationMs"] >= 0
 
 
 @pytest.mark.anyio
@@ -233,7 +276,9 @@ async def test_pdf_over_ocr_pixel_limit_returns_stable_error(
 async def test_doc_upload_converts_to_docx_before_markitdown(
     core_settings: CoreSettings,
     tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
 ) -> None:
+    configure_logging(environment="production", log_level="INFO")
     calls: dict[str, object] = {}
     binary = _fake_soffice(tmp_path)
     settings = core_settings.model_copy(update={"libreoffice_binary": str(binary)})
@@ -260,6 +305,12 @@ async def test_doc_upload_converts_to_docx_before_markitdown(
     assert calls["path"].suffix == ".docx"  # type: ignore[union-attr]
     assert calls["kwargs"] == {"file_extension": ".docx"}
     assert not calls["path"].exists()  # type: ignore[union-attr]
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    doc_event = next(event for event in events if event["event"] == "doc.convert")
+    assert doc_event["converter"] == "libreoffice"
+    assert doc_event["returnCode"] == 0
+    assert doc_event["timedOut"] is False
+    assert doc_event["durationMs"] >= 0
 
 
 @pytest.mark.anyio
@@ -305,7 +356,10 @@ async def test_invalid_doc_converter_cleans_temp_files_and_returns_stable_error(
 async def test_generic_conversion_failure_returns_stable_error(
     core_settings: CoreSettings,
     tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
 ) -> None:
+    configure_logging(environment="production", log_level="INFO")
+
     class Converter:
         def convert_local(self, path: str | Path, **kwargs: object) -> object:
             raise RuntimeError("boom")
@@ -319,6 +373,43 @@ async def test_generic_conversion_failure_returns_stable_error(
         )
 
     assert exc_info.value.code == "document_conversion_failed"
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    conversion = next(event for event in events if event["event"] == "markitdown.convert")
+    assert conversion["outcome"] == "failed"
+    assert conversion["errorCode"] == "document_conversion_failed"
+    assert conversion["durationMs"] >= 0
+
+
+@pytest.mark.anyio
+async def test_empty_markdown_logs_failed_conversion_stage(
+    core_settings: CoreSettings,
+    tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    configure_logging(environment="production", log_level="INFO")
+
+    @dataclass
+    class Result:
+        text_content: str
+
+    class Converter:
+        def convert_local(self, path: str | Path, **kwargs: object) -> Result:
+            return Result(text_content="   ")
+
+    upload_path = tmp_path / "sample.html"
+    upload_path.write_text("<html></html>")
+
+    with pytest.raises(IntakeError) as exc_info:
+        await MarkItDownExtractor(Converter(), core_settings).extract(
+            _upload(upload_path, SupportedDocumentType.HTML)
+        )
+
+    assert exc_info.value.code == "document_conversion_failed"
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    conversion = next(event for event in events if event["event"] == "markitdown.convert")
+    assert conversion["outcome"] == "empty"
+    assert conversion["errorCode"] == "document_conversion_failed"
+    assert conversion["durationMs"] >= 0
 
 
 class _NeverCalledConverter:

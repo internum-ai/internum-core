@@ -9,7 +9,7 @@ from api.common.errors import (
     build_error_envelope,
     install_exception_handlers,
 )
-from api.common.logging import RequestContextMiddleware, log_event
+from api.common.logging import RequestContextMiddleware, configure_logging, log_event
 from api.common.usage import InMemoryUsageTracker, UsageRecord, UsageTracker
 
 __all__ = [
@@ -25,6 +25,7 @@ __all__ = [
     "UsageRecord",
     "UsageTracker",
     "build_error_envelope",
+    "configure_logging",
     "get_settings",
     "install_exception_handlers",
     "log_event",

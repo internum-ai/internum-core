@@ -1,6 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
-from typing import Self
+from typing import Literal, Self
 
 from internum_config import InternumBaseSettings
 from pydantic import Field, SecretStr, field_validator
@@ -32,6 +32,8 @@ class CoreSettings(InternumBaseSettings):
     )
 
     openrouter_api_key: SecretStr = Field(min_length=1)
+    environment: Literal["development", "production"] = "development"
+    log_level: str | None = None
     default_model: str = Field(min_length=1)
     default_system_prompt: str = Field(min_length=1)
     timeout_seconds: float = Field(gt=0)
@@ -55,6 +57,16 @@ class CoreSettings(InternumBaseSettings):
         if not stripped:
             raise ValueError("value must not be blank")
         return stripped
+
+    @field_validator("log_level")
+    @classmethod
+    def normalize_log_level(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().upper()
+        if normalized not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            raise ValueError("log level must be DEBUG, INFO, WARNING, ERROR, or CRITICAL")
+        return normalized
 
     @field_validator("api_consumers")
     @classmethod

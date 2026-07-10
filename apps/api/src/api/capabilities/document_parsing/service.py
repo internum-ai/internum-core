@@ -1,3 +1,6 @@
+import json
+import logging
+import time
 from dataclasses import replace
 from typing import Any, Protocol
 
@@ -9,6 +12,7 @@ from api.capabilities.document_parsing.models import (
     ParseMultipartRequest,
 )
 from api.common.errors import SchemaError
+from api.common.logging import log_event
 from api.config.overrides import resolve_request_overrides
 from api.config.settings import CoreSettings
 from api.platform.openrouter import OpenRouterRequest, OpenRouterResult
@@ -67,7 +71,6 @@ class DocumentParsingService:
                     ocr_page_count=None,
                     converter=None,
                 )
-
         openrouter_request = OpenRouterRequest(
             model=resolved.model,
             system_prompt=resolved.system_prompt,
@@ -79,15 +82,31 @@ class DocumentParsingService:
         )
         result = await self._openrouter_client.complete(openrouter_request)
         try:
-            data = _repair_and_validate(result.content, request.schema)
+            data = _repair_and_validate(
+                result.content,
+                request.schema,
+                failure_triggers_retry=True,
+            )
         except SchemaError as error:
+            retry_attempt = result.attempt + 1
+            log_event(
+                "model.retry",
+                level=logging.WARNING,
+                reason="schema_rejection",
+                attempt=retry_attempt,
+            )
             retry_result = await self._openrouter_client.complete(
                 replace(
                     openrouter_request,
                     validation_retry_prompt=format_validation_retry(error),
+                    attempt=retry_attempt,
                 )
             )
-            data = _repair_and_validate(retry_result.content, request.schema)
+            data = _repair_and_validate(
+                retry_result.content,
+                request.schema,
+                validation_retry_triggered=True,
+            )
 
         return ParsedDocument(data=data, metadata=metadata)
 
@@ -103,9 +122,49 @@ def _build_user_content(markdown: str, additional_context: str | None) -> str:
     return "\n\n".join(sections)
 
 
-def _repair_and_validate(raw_output: str, schema: dict[str, Any]) -> dict[str, Any]:
-    repaired = repair_json_output(raw_output)
-    validated = validate_against_original(repaired, schema)
-    if not isinstance(validated, dict):
-        raise SchemaError("Model output must be a JSON object")
+def _repair_and_validate(
+    raw_output: str,
+    schema: dict[str, Any],
+    *,
+    validation_retry_triggered: bool = False,
+    failure_triggers_retry: bool = False,
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    repair_applied = _requires_json_repair(raw_output)
+    try:
+        repaired = repair_json_output(raw_output)
+        validated = validate_against_original(repaired, schema)
+        if not isinstance(validated, dict):
+            raise SchemaError("Model output must be a JSON object")
+    except SchemaError:
+        log_event(
+            "schema.validation",
+            level=logging.WARNING,
+            passed=False,
+            repairApplied=repair_applied,
+            validationRetryTriggered=failure_triggers_retry or validation_retry_triggered,
+            durationMs=_duration_ms(started_at),
+        )
+        raise
+
+    log_event(
+        "schema.validation",
+        passed=True,
+        repairApplied=repair_applied,
+        validationRetryTriggered=validation_retry_triggered,
+        durationMs=_duration_ms(started_at),
+    )
+    log_event("schema.values", level=logging.DEBUG, values=validated)
     return validated
+
+
+def _requires_json_repair(raw_output: str) -> bool:
+    try:
+        json.loads(raw_output)
+    except json.JSONDecodeError:
+        return True
+    return False
+
+
+def _duration_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1000, 3)

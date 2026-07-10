@@ -1,3 +1,5 @@
+import logging
+import time
 from collections.abc import Sequence
 from http import HTTPStatus
 from typing import Any
@@ -5,6 +7,8 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+
+from api.common.logging import log_event
 
 
 class ApiError(Exception):
@@ -52,6 +56,7 @@ class IntakeError(ApiError):
         code: str = "intake_error",
         details: dict[str, Any] | None = None,
     ) -> None:
+        self.intake_event_logged = False
         super().__init__(code, message, status_code=HTTPStatus.BAD_REQUEST, details=details)
 
 
@@ -63,7 +68,13 @@ class SchemaError(ApiError):
 
 
 class UpstreamError(ApiError):
-    def __init__(self, message: str = "Upstream provider failed") -> None:
+    def __init__(
+        self,
+        message: str = "Upstream provider failed",
+        *,
+        attempt: int | None = None,
+    ) -> None:
+        self.attempt = attempt
         super().__init__("upstream_error", message, status_code=HTTPStatus.BAD_GATEWAY)
 
 
@@ -88,6 +99,25 @@ def build_error_envelope(
 def install_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(ApiError)
     async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
+        if isinstance(exc, IntakeError):
+            details = exc.details if isinstance(exc.details, dict) else {}
+            if not exc.intake_event_logged:
+                log_event(
+                    "intake.rejected",
+                    level=logging.WARNING,
+                    code=exc.code,
+                    documentType=details.get("documentType", "unknown"),
+                    durationMs=_request_duration_ms(request),
+                    requestId=getattr(request.state, "request_id", None),
+                )
+        log_event(
+            "request.failed",
+            level=logging.ERROR,
+            code=exc.code,
+            statusCode=exc.status_code,
+            exceptionType=type(exc).__name__,
+            requestId=getattr(request.state, "request_id", None),
+        )
         return JSONResponse(
             status_code=exc.status_code,
             content=build_error_envelope(
@@ -102,6 +132,14 @@ def install_exception_handlers(app: FastAPI) -> None:
     async def validation_error_handler(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
+        log_event(
+            "request.failed",
+            level=logging.ERROR,
+            code="validation_error",
+            statusCode=HTTPStatus.UNPROCESSABLE_ENTITY,
+            exceptionType=type(exc).__name__,
+            requestId=getattr(request.state, "request_id", None),
+        )
         return JSONResponse(
             status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
             content=build_error_envelope(
@@ -123,3 +161,8 @@ def _sanitize_validation_errors(errors: Sequence[Any]) -> list[dict[str, Any]]:
         }
         sanitized.append(sanitized_error)
     return sanitized
+
+
+def _request_duration_ms(request: Request) -> float:
+    started_at = getattr(request.state, "request_started_at", time.perf_counter())
+    return round((time.perf_counter() - started_at) * 1000, 3)

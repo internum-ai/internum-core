@@ -1,7 +1,9 @@
+import logging
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -17,6 +19,7 @@ from api.capabilities.document_parsing.models import (
     SupportedDocumentType,
 )
 from api.common.errors import ConfigurationError, IntakeError
+from api.common.logging import log_event
 from api.config.settings import CoreSettings
 from api.platform.openrouter import build_openai_compatible_client
 
@@ -41,11 +44,34 @@ class MarkItDownExtractor:
         document_type = upload.document_type
 
         if upload.document_type is SupportedDocumentType.PDF:
-            preflight = await run_in_threadpool(_preflight_pdf, upload.path, self._settings)
+            started_at = time.perf_counter()
+            try:
+                preflight = await run_in_threadpool(_preflight_pdf, upload.path, self._settings)
+            except IntakeError as exc:
+                details = exc.details if isinstance(exc.details, dict) else {}
+                log_event(
+                    "pdf.preflight",
+                    level=logging.WARNING,
+                    outcome="rejected",
+                    errorCode=exc.code,
+                    pageCount=details.get("pageCount"),
+                    durationMs=_duration_ms(started_at),
+                )
+                raise
+            log_event(
+                "pdf.preflight",
+                outcome="passed",
+                pageCount=preflight.page_count,
+                nativeTextPages=preflight.native_text_pages,
+                scanLikePages=preflight.scan_like_pages,
+                extractionMode=preflight.extraction_mode.value,
+                durationMs=_duration_ms(started_at),
+            )
         elif upload.document_type is SupportedDocumentType.DOC:
             source_path = await run_in_threadpool(_convert_doc_to_docx, upload.path, self._settings)
             extension = SupportedDocumentType.DOCX.extension
 
+        started_at = time.perf_counter()
         try:
             result = await run_in_threadpool(
                 self._converter.convert_local,
@@ -53,6 +79,15 @@ class MarkItDownExtractor:
                 file_extension=extension,
             )
         except Exception as exc:
+            log_event(
+                "markitdown.convert",
+                level=logging.WARNING,
+                converter="markitdown",
+                extension=extension,
+                outcome="failed",
+                errorCode="document_conversion_failed",
+                durationMs=_duration_ms(started_at),
+            )
             raise IntakeError(
                 "Document could not be converted to Markdown",
                 code="document_conversion_failed",
@@ -64,11 +99,30 @@ class MarkItDownExtractor:
 
         text_content = getattr(result, "text_content", None)
         if not isinstance(text_content, str) or not text_content.strip():
+            log_event(
+                "markitdown.convert",
+                level=logging.WARNING,
+                converter="markitdown",
+                extension=extension,
+                outcome="empty",
+                errorCode="document_conversion_failed",
+                durationMs=_duration_ms(started_at),
+                markdownLength=len(text_content) if isinstance(text_content, str) else 0,
+            )
             raise IntakeError(
                 "Document conversion produced no Markdown content",
                 code="document_conversion_failed",
                 details={"documentType": document_type.value},
             )
+        log_event(
+            "markitdown.convert",
+            converter="markitdown",
+            extension=extension,
+            outcome="succeeded",
+            durationMs=_duration_ms(started_at),
+            markdownLength=len(text_content),
+        )
+        log_event("markitdown.output", level=logging.DEBUG, markdown=text_content)
         return ExtractedDocument(
             markdown=text_content,
             metadata=_metadata_for(upload.document_type, preflight),
@@ -203,8 +257,10 @@ def _enforce_ocr_pixel_budget(rect: Any, settings: CoreSettings) -> None:
 
 
 def _convert_doc_to_docx(path: Path, settings: CoreSettings) -> Path:
+    started_at = time.perf_counter()
     binary = _resolve_executable(settings.libreoffice_binary)
     if binary is None:
+        _log_doc_conversion(started_at, return_code=None, timed_out=False, failed=True)
         raise IntakeError(
             "DOC converter is unavailable",
             code="doc_converter_unavailable",
@@ -242,6 +298,7 @@ def _convert_doc_to_docx(path: Path, settings: CoreSettings) -> Path:
         )
     except subprocess.TimeoutExpired as exc:
         shutil.rmtree(temp_root, ignore_errors=True)
+        _log_doc_conversion(started_at, return_code=None, timed_out=True, failed=True)
         raise IntakeError(
             "DOC conversion timed out",
             code="doc_conversion_timeout",
@@ -249,21 +306,53 @@ def _convert_doc_to_docx(path: Path, settings: CoreSettings) -> Path:
         ) from exc
     except FileNotFoundError as exc:
         shutil.rmtree(temp_root, ignore_errors=True)
+        _log_doc_conversion(started_at, return_code=None, timed_out=False, failed=True)
         raise IntakeError("DOC converter is unavailable", code="doc_converter_unavailable") from exc
     except OSError as exc:
         shutil.rmtree(temp_root, ignore_errors=True)
+        _log_doc_conversion(started_at, return_code=None, timed_out=False, failed=True)
         raise IntakeError("DOC converter is unavailable", code="doc_converter_unavailable") from exc
 
     converted_path = output_dir / "input.docx"
     if completed.returncode != 0 or not converted_path.exists():
         shutil.rmtree(temp_root, ignore_errors=True)
+        _log_doc_conversion(
+            started_at,
+            return_code=completed.returncode,
+            timed_out=False,
+            failed=True,
+        )
         raise IntakeError(
             "DOC conversion failed",
             code="doc_conversion_failed",
             details={"returnCode": completed.returncode},
         )
 
+    _log_doc_conversion(
+        started_at,
+        return_code=completed.returncode,
+        timed_out=False,
+        failed=False,
+    )
     return converted_path
+
+
+def _log_doc_conversion(
+    started_at: float,
+    *,
+    return_code: int | None,
+    timed_out: bool,
+    failed: bool,
+) -> None:
+    log_event(
+        "doc.convert",
+        level=logging.WARNING if failed else logging.INFO,
+        converter="libreoffice",
+        via="libreoffice",
+        durationMs=_duration_ms(started_at),
+        returnCode=return_code,
+        timedOut=timed_out,
+    )
 
 
 def _cleanup_conversion_path(path: Path) -> None:
@@ -296,3 +385,7 @@ def _is_runnable_libreoffice(binary: str) -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     return completed.returncode == 0
+
+
+def _duration_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1000, 3)

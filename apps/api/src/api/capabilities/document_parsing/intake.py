@@ -1,5 +1,7 @@
 import json
+import logging
 import tempfile
+import time
 import zipfile
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
@@ -17,6 +19,7 @@ from api.capabilities.document_parsing.models import (
     SupportedDocumentType,
 )
 from api.common.errors import IntakeError
+from api.common.logging import log_event
 from api.config.overrides import SafeRequestOverrides
 
 try:
@@ -37,9 +40,10 @@ async def parse_multipart_request(
     *,
     max_upload_bytes: int,
 ) -> ParseMultipartRequest:
-    _reject_oversized_body(request, max_upload_bytes=max_upload_bytes)
+    started_at = time.perf_counter()
     form: FormData | None = None
     try:
+        _reject_oversized_body(request, max_upload_bytes=max_upload_bytes)
         form = await _parse_limited_multipart_form(
             request,
             max_upload_bytes=max_upload_bytes,
@@ -57,7 +61,14 @@ async def parse_multipart_request(
     except MultiPartException as exc:
         if form is not None:
             await form.close()
-        raise IntakeError(_multipart_error_message(exc.message)) from exc
+        error = IntakeError(_multipart_error_message(exc.message))
+        _log_intake_rejection(error, started_at=started_at, document_type="unknown")
+        raise error from exc
+    except IntakeError as exc:
+        if form is not None:
+            await form.close()
+        _log_intake_rejection(exc, started_at=started_at, document_type="unknown")
+        raise
     except Exception:
         if form is not None:
             await form.close()
@@ -75,6 +86,8 @@ async def stored_upload(
     max_ooxml_compression_ratio: float,
 ) -> AsyncIterator[StoredUpload]:
     temp_path: Path | None = None
+    started_at = time.perf_counter()
+    document_type: SupportedDocumentType | None = None
     try:
         temp_path, size_bytes = await _stream_to_temp(upload, max_upload_bytes=max_upload_bytes)
         document_type, detected_mime = detect_document_type(
@@ -85,6 +98,14 @@ async def stored_upload(
         )
         if document_type in {SupportedDocumentType.JPEG, SupportedDocumentType.PNG}:
             _validate_image_dimensions(temp_path, max_image_pixels=max_image_pixels)
+        log_event(
+            "intake.stored",
+            documentType=document_type.value,
+            sizeBytes=size_bytes,
+            declaredContentType=upload.content_type,
+            detectedContentType=detected_mime,
+            durationMs=_duration_ms(started_at),
+        )
         yield StoredUpload(
             path=temp_path,
             document_type=document_type,
@@ -92,10 +113,39 @@ async def stored_upload(
             original_filename=upload.filename,
             detected_mime=detected_mime,
         )
+    except IntakeError as exc:
+        _log_intake_rejection(
+            exc,
+            started_at=started_at,
+            document_type=document_type.value if document_type is not None else "unknown",
+        )
+        raise
     finally:
         await upload.close()
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
+
+
+def _duration_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1000, 3)
+
+
+def _log_intake_rejection(
+    error: IntakeError,
+    *,
+    started_at: float,
+    document_type: str,
+) -> None:
+    if error.intake_event_logged:
+        return
+    log_event(
+        "intake.rejected",
+        level=logging.WARNING,
+        code=error.code,
+        documentType=document_type,
+        durationMs=_duration_ms(started_at),
+    )
+    error.intake_event_logged = True
 
 
 def detect_document_type(

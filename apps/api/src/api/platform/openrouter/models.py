@@ -25,6 +25,7 @@ class OpenRouterRequest:
     request_id: str | None = None
     images: list[ImageInput] = field(default_factory=list)
     validation_retry_prompt: str | None = None
+    attempt: int = 1
 
 
 @dataclass(frozen=True)
@@ -36,3 +37,4 @@ class OpenRouterResult:
     completion_tokens: int
     total_tokens: int
     cost_usd: Decimal | None
+    attempt: int = 1
