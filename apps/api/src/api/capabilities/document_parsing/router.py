@@ -30,6 +30,7 @@ async def parse_document(request: Request) -> dict[str, Any]:
         parse_request,
         consumer_id=consumer.id if isinstance(consumer, ConsumerIdentity) else None,
         request_id=getattr(request.state, "request_id", None),
+        is_disconnected=request.is_disconnected,
     )
     return {"data": parsed.data, "meta": parsed.metadata.to_api()}
 

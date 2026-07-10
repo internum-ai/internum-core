@@ -16,6 +16,9 @@ class SafeRequestOverrides(BaseModel):
 class ResolvedModelConfig:
     model: str
     system_prompt: str
+    reasoning_effort: str | None
+    temperature: float | None
+    max_output_tokens: int | None
 
 
 def resolve_request_overrides(
@@ -26,9 +29,15 @@ def resolve_request_overrides(
         return ResolvedModelConfig(
             model=settings.default_model,
             system_prompt=settings.default_system_prompt,
+            reasoning_effort=settings.default_reasoning_effort,
+            temperature=settings.default_temperature,
+            max_output_tokens=settings.default_max_output_tokens,
         )
 
     return ResolvedModelConfig(
         model=overrides.model or settings.default_model,
         system_prompt=overrides.system_prompt or settings.default_system_prompt,
+        reasoning_effort=settings.default_reasoning_effort,
+        temperature=settings.default_temperature,
+        max_output_tokens=settings.default_max_output_tokens,
     )

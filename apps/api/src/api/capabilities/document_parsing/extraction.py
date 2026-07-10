@@ -67,6 +67,23 @@ class MarkItDownExtractor:
                 extractionMode=preflight.extraction_mode.value,
                 durationMs=_duration_ms(started_at),
             )
+            if (
+                preflight.extraction_mode is ExtractionMode.NATIVE
+                and preflight.native_text
+                and preflight.native_text.strip()
+            ):
+                log_event(
+                    "pdf.extract",
+                    converter="pymupdf",
+                    extension=extension,
+                    outcome="succeeded",
+                    markdownLength=len(preflight.native_text),
+                )
+                log_event("pdf.extract.output", level=logging.DEBUG, markdown=preflight.native_text)
+                return ExtractedDocument(
+                    markdown=preflight.native_text,
+                    metadata=_metadata_for(upload.document_type, preflight, converter="pymupdf"),
+                )
         elif upload.document_type is SupportedDocumentType.DOC:
             source_path = await run_in_threadpool(_convert_doc_to_docx, upload.path, self._settings)
             extension = SupportedDocumentType.DOCX.extension
@@ -163,6 +180,8 @@ def validate_document_runtime(settings: CoreSettings) -> None:
 def _metadata_for(
     document_type: SupportedDocumentType,
     preflight: PdfPreflightResult | None,
+    *,
+    converter: str = "markitdown",
 ) -> ParseMetadata:
     if preflight is None:
         return ParseMetadata(
@@ -170,14 +189,14 @@ def _metadata_for(
             extraction_mode=None,
             page_count=None,
             ocr_page_count=None,
-            converter="markitdown",
+            converter=converter,
         )
     return ParseMetadata(
         document_type=document_type,
         extraction_mode=preflight.extraction_mode,
         page_count=preflight.page_count,
         ocr_page_count=preflight.scan_like_pages,
-        converter="markitdown",
+        converter=converter,
     )
 
 
@@ -200,8 +219,10 @@ def _preflight_pdf(path: Path, settings: CoreSettings) -> PdfPreflightResult:
         native_text_pages = 0
         scan_like_pages = 0
         empty_pages = 0
+        page_texts: list[str] = []
         for page in document:
-            text = page.get_text("text").strip()
+            raw_text = page.get_text("text")
+            text = raw_text.strip()
             has_native_text = len(text) >= 20
             has_image = bool(page.get_images(full=True))
             if has_native_text:
@@ -211,6 +232,7 @@ def _preflight_pdf(path: Path, settings: CoreSettings) -> PdfPreflightResult:
                 scan_like_pages += 1
             else:
                 empty_pages += 1
+            page_texts.append(raw_text)
 
         if scan_like_pages > settings.max_ocr_pages:
             raise IntakeError(
@@ -230,11 +252,14 @@ def _preflight_pdf(path: Path, settings: CoreSettings) -> PdfPreflightResult:
         else:
             mode = ExtractionMode.NATIVE
 
+        native_text = "\n".join(page_texts) if mode is ExtractionMode.NATIVE else None
+
         return PdfPreflightResult(
             page_count=page_count,
             native_text_pages=native_text_pages,
             scan_like_pages=scan_like_pages,
             extraction_mode=mode,
+            native_text=native_text,
         )
     finally:
         document.close()

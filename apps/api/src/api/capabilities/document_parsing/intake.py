@@ -52,11 +52,13 @@ async def parse_multipart_request(
         schema = _extract_schema(form)
         overrides = _extract_overrides(form)
         additional_context = _optional_text(form, "additionalContext")
+        checks = _extract_checks(form)
         return ParseMultipartRequest(
             upload=upload,
             schema=schema,
             additional_context=additional_context,
             overrides=overrides,
+            checks=checks,
         )
     except MultiPartException as exc:
         if form is not None:
@@ -250,7 +252,7 @@ async def _parse_limited_multipart_form(
         Headers(raw=request.headers.raw),
         _limited_body_stream(request, max_body_bytes=_max_body_bytes(max_upload_bytes)),
         max_files=1,
-        max_fields=4,
+        max_fields=5,
         max_part_size=FORM_FIELD_LIMIT_BYTES,
     )
     return await parser.parse()
@@ -289,6 +291,20 @@ def _extract_schema(form: FormData) -> dict[str, Any]:
     if not isinstance(schema, dict):
         raise IntakeError("Schema field must contain a JSON object")
     return schema
+
+
+def _extract_checks(form: FormData) -> list[dict[str, Any]]:
+    raw_checks = _optional_text(form, "checks")
+    if raw_checks is None:
+        return []
+    try:
+        checks = json.loads(raw_checks)
+    except json.JSONDecodeError as exc:
+        raise IntakeError("Checks field must contain valid JSON") from exc
+
+    if not isinstance(checks, list):
+        raise IntakeError("Checks field must contain a JSON array")
+    return checks
 
 
 def _extract_overrides(form: FormData) -> SafeRequestOverrides:

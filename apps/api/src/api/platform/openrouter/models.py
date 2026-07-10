@@ -26,6 +26,9 @@ class OpenRouterRequest:
     images: list[ImageInput] = field(default_factory=list)
     validation_retry_prompt: str | None = None
     attempt: int = 1
+    reasoning_effort: str | None = None
+    temperature: float | None = None
+    max_output_tokens: int | None = None
 
 
 @dataclass(frozen=True)

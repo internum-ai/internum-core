@@ -2,6 +2,7 @@ import pytest
 
 from api.common.errors import SchemaError
 from api.platform.schema import (
+    evaluate_post_checks,
     format_validation_retry,
     normalize_for_model,
     repair_json_output,
@@ -83,3 +84,85 @@ def test_format_validation_retry_includes_path_and_message() -> None:
 
     assert "name" in retry
     assert "None is not of type" in retry
+
+
+def test_evaluate_post_checks_returns_empty_list_for_no_checks() -> None:
+    assert evaluate_post_checks({"total": 10}, []) == []
+
+
+def test_evaluate_post_checks_passes_when_sum_matches_total() -> None:
+    data = {"lineItems": {"a": 4, "b": 6}, "total": 10}
+    checks = [
+        {
+            "op": "sum_equals",
+            "addends": ["/lineItems/a", "/lineItems/b"],
+            "total": "/total",
+            "tolerance": 0,
+        }
+    ]
+
+    results = evaluate_post_checks(data, checks)
+
+    assert len(results) == 1
+    assert results[0].op == "sum_equals"
+    assert results[0].passed is True
+
+
+def test_evaluate_post_checks_fails_when_sum_exceeds_tolerance() -> None:
+    data = {"lineItems": {"a": 4, "b": 6}, "total": 11}
+    checks = [
+        {
+            "op": "sum_equals",
+            "addends": ["/lineItems/a", "/lineItems/b"],
+            "total": "/total",
+            "tolerance": 0.01,
+        }
+    ]
+
+    results = evaluate_post_checks(data, checks)
+
+    assert len(results) == 1
+    assert results[0].passed is False
+
+
+def test_evaluate_post_checks_missing_pointer_fails_with_reason() -> None:
+    data = {"total": 10}
+    checks = [
+        {
+            "op": "sum_equals",
+            "addends": ["/lineItems/a", "/lineItems/b"],
+            "total": "/total",
+            "tolerance": 0,
+        }
+    ]
+
+    results = evaluate_post_checks(data, checks)
+
+    assert len(results) == 1
+    assert results[0].passed is False
+    assert "reason" in results[0].detail
+
+
+def test_evaluate_post_checks_fans_out_over_scope_array() -> None:
+    data = {
+        "invoices": [
+            {"a": 1, "b": 2, "total": 3},
+            {"a": 1, "b": 2, "total": 5},
+        ]
+    }
+    checks = [
+        {
+            "op": "sum_equals",
+            "addends": ["/a", "/b"],
+            "total": "/total",
+            "tolerance": 0,
+            "scope": "/invoices",
+        }
+    ]
+
+    results = evaluate_post_checks(data, checks)
+
+    assert len(results) == 2
+    assert results[0].passed is True
+    assert results[1].passed is False
+    assert results[1].detail.get("index") == 1

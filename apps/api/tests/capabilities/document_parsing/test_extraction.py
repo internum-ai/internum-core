@@ -97,19 +97,8 @@ async def test_pdf_preflight_reports_native_metadata(
     core_settings: CoreSettings,
     tmp_path: Path,
 ) -> None:
-    calls: dict[str, object] = {}
-
-    @dataclass
-    class Result:
-        text_content: str
-
-    class Converter:
-        def convert_local(self, path: str | Path, **kwargs: object) -> Result:
-            calls["kwargs"] = kwargs
-            return Result(text_content="# Native")
-
     upload_path = _native_pdf(tmp_path / "native.pdf")
-    extracted = await MarkItDownExtractor(Converter(), core_settings).extract(
+    extracted = await MarkItDownExtractor(_NeverCalledConverter(), core_settings).extract(
         _upload(upload_path, SupportedDocumentType.PDF)
     )
 
@@ -118,29 +107,36 @@ async def test_pdf_preflight_reports_native_metadata(
         "extractionMode": "native",
         "pageCount": 1,
         "ocrPageCount": 0,
-        "converter": "markitdown",
+        "converter": "pymupdf",
+        "usage": None,
+        "checks": [],
     }
-    assert calls["kwargs"] == {"file_extension": ".pdf"}
 
 
 @pytest.mark.anyio
-async def test_extraction_logs_pdf_preflight_and_markitdown_debug_output(
+async def test_native_pdf_uses_fitz_text_and_skips_markitdown(
+    core_settings: CoreSettings,
+    tmp_path: Path,
+) -> None:
+    upload_path = _native_pdf(tmp_path / "native.pdf")
+    extracted = await MarkItDownExtractor(_NeverCalledConverter(), core_settings).extract(
+        _upload(upload_path, SupportedDocumentType.PDF)
+    )
+
+    assert extracted.metadata.to_api()["converter"] == "pymupdf"
+    assert "This native PDF has enough text to classify as native." in extracted.markdown
+
+
+@pytest.mark.anyio
+async def test_extraction_logs_pdf_preflight_and_fitz_debug_output(
     core_settings: CoreSettings,
     tmp_path: Path,
     capsys,  # type: ignore[no-untyped-def]
 ) -> None:
     configure_logging(environment="production", log_level="DEBUG")
 
-    @dataclass
-    class Result:
-        text_content: str
-
-    class Converter:
-        def convert_local(self, path: str | Path, **kwargs: object) -> Result:
-            return Result(text_content="# Private markdown")
-
     upload_path = _native_pdf(tmp_path / "native-logged.pdf")
-    await MarkItDownExtractor(Converter(), core_settings).extract(
+    await MarkItDownExtractor(_NeverCalledConverter(), core_settings).extract(
         _upload(upload_path, SupportedDocumentType.PDF)
     )
 
@@ -151,10 +147,12 @@ async def test_extraction_logs_pdf_preflight_and_markitdown_debug_output(
     assert by_name["pdf.preflight"]["scanLikePages"] == 0
     assert by_name["pdf.preflight"]["extractionMode"] == "native"
     assert by_name["pdf.preflight"]["durationMs"] >= 0
-    assert by_name["markitdown.convert"]["extension"] == ".pdf"
-    assert by_name["markitdown.convert"]["markdownLength"] == 18
-    assert by_name["markitdown.convert"]["durationMs"] >= 0
-    assert by_name["markitdown.output"]["markdown"] == "# Private markdown"
+    assert by_name["pdf.extract"]["converter"] == "pymupdf"
+    assert by_name["pdf.extract"]["outcome"] == "succeeded"
+    assert (
+        "This native PDF has enough text to classify as native."
+        in (by_name["pdf.extract.output"]["markdown"])
+    )
 
 
 @pytest.mark.anyio

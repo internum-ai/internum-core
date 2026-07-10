@@ -1,6 +1,8 @@
+import asyncio
 import json
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any, Protocol
 
@@ -10,6 +12,8 @@ from api.capabilities.document_parsing.models import (
     ParsedDocument,
     ParseMetadata,
     ParseMultipartRequest,
+    PostCheckResult,
+    UsageSummary,
 )
 from api.common.errors import SchemaError
 from api.common.logging import log_event
@@ -17,10 +21,13 @@ from api.config.overrides import resolve_request_overrides
 from api.config.settings import CoreSettings
 from api.platform.openrouter import OpenRouterRequest, OpenRouterResult
 from api.platform.schema import (
+    evaluate_post_checks,
     format_validation_retry,
     repair_json_output,
     validate_against_original,
 )
+
+DISCONNECT_POLL_INTERVAL_SECONDS = 0.05
 
 
 class OpenRouterCompleter(Protocol):
@@ -43,6 +50,48 @@ class DocumentParsingService:
         self._openrouter_client = openrouter_client
 
     async def parse(
+        self,
+        request: ParseMultipartRequest,
+        *,
+        consumer_id: str | None,
+        request_id: str | None,
+        is_disconnected: Callable[[], Awaitable[bool]] | None = None,
+    ) -> ParsedDocument:
+        if is_disconnected is None:
+            return await self._run_parse(
+                request,
+                consumer_id=consumer_id,
+                request_id=request_id,
+            )
+        return await self._run_with_disconnect_supervisor(
+            request,
+            consumer_id=consumer_id,
+            request_id=request_id,
+            is_disconnected=is_disconnected,
+        )
+
+    async def _run_with_disconnect_supervisor(
+        self,
+        request: ParseMultipartRequest,
+        *,
+        consumer_id: str | None,
+        request_id: str | None,
+        is_disconnected: Callable[[], Awaitable[bool]],
+    ) -> ParsedDocument:
+        task = asyncio.create_task(
+            self._run_parse(request, consumer_id=consumer_id, request_id=request_id)
+        )
+        poller = asyncio.create_task(_poll_disconnect(task, is_disconnected))
+        try:
+            return await task
+        finally:
+            poller.cancel()
+            try:
+                await poller
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _run_parse(
         self,
         request: ParseMultipartRequest,
         *,
@@ -79,6 +128,9 @@ class DocumentParsingService:
             capability="document_parsing",
             consumer_id=consumer_id,
             request_id=request_id,
+            reasoning_effort=resolved.reasoning_effort,
+            temperature=resolved.temperature,
+            max_output_tokens=resolved.max_output_tokens,
         )
         result = await self._openrouter_client.complete(openrouter_request)
         try:
@@ -107,8 +159,42 @@ class DocumentParsingService:
                 request.schema,
                 validation_retry_triggered=True,
             )
+            result = retry_result
+
+        usage = UsageSummary(
+            model=result.model,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens,
+            cost_usd=result.cost_usd,
+        )
+        checks = [
+            PostCheckResult(op=outcome.op, passed=outcome.passed, detail=outcome.detail)
+            for outcome in evaluate_post_checks(data, request.checks)
+        ]
+        for check in checks:
+            log_event(
+                "schema.postcheck",
+                level=logging.INFO if check.passed else logging.WARNING,
+                op=check.op,
+                passed=check.passed,
+                detail=check.detail,
+                requestId=request_id,
+            )
+        metadata = replace(metadata, usage=usage, checks=checks)
 
         return ParsedDocument(data=data, metadata=metadata)
+
+
+async def _poll_disconnect(
+    task: asyncio.Task[ParsedDocument],
+    is_disconnected: Callable[[], Awaitable[bool]],
+) -> None:
+    while not task.done():
+        if await is_disconnected() is True:
+            task.cancel()
+            return
+        await asyncio.sleep(DISCONNECT_POLL_INTERVAL_SECONDS)
 
 
 def _build_user_content(markdown: str, additional_context: str | None) -> str:

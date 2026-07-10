@@ -74,6 +74,14 @@ def test_valid_docx_intake_reaches_parser_and_cleans_temp_file(
             "pageCount": None,
             "ocrPageCount": None,
             "converter": None,
+            "usage": {
+                "model": "openai/gpt-5.2",
+                "promptTokens": 1,
+                "completionTokens": 1,
+                "totalTokens": 2,
+                "costUsd": "0",
+            },
+            "checks": [],
         },
     }
     assert captured_paths

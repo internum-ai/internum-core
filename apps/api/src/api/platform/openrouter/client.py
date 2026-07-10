@@ -87,6 +87,13 @@ class OpenRouterClient:
             "messages": messages,
         }
 
+        if request.reasoning_effort is not None:
+            payload["reasoning"] = {"effort": request.reasoning_effort}
+        if request.temperature is not None:
+            payload["temperature"] = request.temperature
+        if request.max_output_tokens is not None:
+            payload["max_tokens"] = request.max_output_tokens
+
         if native_structured:
             payload["provider"] = {"require_parameters": True}
             payload["response_format"] = {
@@ -155,7 +162,20 @@ class OpenRouterClient:
                     structured_mode=structured_mode,
                     error=error,
                 )
-                raise error from exc
+                if retry_offset >= self._max_retries:
+                    raise error from exc
+                next_attempt = attempt_number + 1
+                log_event(
+                    "model.retry",
+                    level=logging.WARNING,
+                    reason="network_error",
+                    attempt=next_attempt,
+                    model=request.model,
+                    requestId=request.request_id,
+                )
+                last_error = error
+                await asyncio.sleep(self._backoff_seconds * (2**retry_offset))
+                continue
 
             if response.status_code < 400:
                 try:

@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,7 @@ class ParseMultipartRequest:
     schema: dict[str, Any]
     additional_context: str | None
     overrides: SafeRequestOverrides
+    checks: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,39 @@ class PdfPreflightResult:
     native_text_pages: int
     scan_like_pages: int
     extraction_mode: ExtractionMode
+    native_text: str | None = None
+
+
+@dataclass(frozen=True)
+class UsageSummary:
+    model: str
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    cost_usd: Decimal | None
+
+    def to_api(self) -> dict[str, Any]:
+        return {
+            "model": self.model,
+            "promptTokens": self.prompt_tokens,
+            "completionTokens": self.completion_tokens,
+            "totalTokens": self.total_tokens,
+            "costUsd": str(self.cost_usd) if self.cost_usd is not None else None,
+        }
+
+
+@dataclass(frozen=True)
+class PostCheckResult:
+    op: str
+    passed: bool
+    detail: dict[str, Any]
+
+    def to_api(self) -> dict[str, Any]:
+        return {
+            "op": self.op,
+            "passed": self.passed,
+            "detail": self.detail,
+        }
 
 
 @dataclass(frozen=True)
@@ -62,6 +97,8 @@ class ParseMetadata:
     page_count: int | None
     ocr_page_count: int | None
     converter: str | None
+    usage: UsageSummary | None = None
+    checks: list[PostCheckResult] = field(default_factory=list)
 
     def to_api(self) -> dict[str, Any]:
         return {
@@ -70,6 +107,8 @@ class ParseMetadata:
             "pageCount": self.page_count,
             "ocrPageCount": self.ocr_page_count,
             "converter": self.converter,
+            "usage": self.usage.to_api() if self.usage else None,
+            "checks": [check.to_api() for check in self.checks],
         }
 
 

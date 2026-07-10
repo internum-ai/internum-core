@@ -287,6 +287,99 @@ async def test_openrouter_client_maps_transport_errors_to_upstream_error(
 
 
 @pytest.mark.anyio
+async def test_openrouter_client_retries_network_errors_then_succeeds(
+    core_settings: CoreSettings,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    configure_logging(environment="production", log_level="INFO")
+    attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ConnectError("boom", request=request)
+        return httpx.Response(200, json=_success_response())
+
+    client = OpenRouterClient(
+        core_settings,
+        InMemoryUsageTracker(),
+        transport=httpx.MockTransport(handler),
+        backoff_seconds=0,
+    )
+
+    result = await client.complete(_openrouter_request())
+
+    assert result.content == '{"name":"Ada"}'
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    requests = [event for event in events if event["event"] == "model.request"]
+    retry = next(event for event in events if event["event"] == "model.retry")
+    assert [event["attempt"] for event in requests] == [1, 2]
+    assert retry["reason"] == "network_error"
+    assert retry["attempt"] == 2
+
+
+@pytest.mark.anyio
+async def test_openrouter_client_raises_after_persistent_network_errors(
+    core_settings: CoreSettings,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    configure_logging(environment="production", log_level="INFO")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom", request=request)
+
+    client = OpenRouterClient(
+        core_settings,
+        InMemoryUsageTracker(),
+        transport=httpx.MockTransport(handler),
+        backoff_seconds=0,
+    )
+
+    with pytest.raises(Exception, match="OpenRouter request failed"):
+        await client.complete(_openrouter_request())
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    requests = [event for event in events if event["event"] == "model.request"]
+    assert [event["attempt"] for event in requests] == [1, 2, 3]
+
+
+@pytest.mark.anyio
+async def test_openrouter_client_composes_network_retry_with_native_schema_fallback(
+    core_settings: CoreSettings,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    configure_logging(environment="production", log_level="INFO")
+    attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ConnectError("boom", request=request)
+        if attempts == 2:
+            return httpx.Response(
+                400,
+                json={"error": {"message": "response_format json_schema unsupported"}},
+            )
+        return httpx.Response(200, json=_success_response())
+
+    client = OpenRouterClient(
+        core_settings,
+        InMemoryUsageTracker(),
+        transport=httpx.MockTransport(handler),
+        backoff_seconds=0,
+    )
+
+    result = await client.complete(_openrouter_request())
+
+    assert result.content == '{"name":"Ada"}'
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    requests = [event for event in events if event["event"] == "model.request"]
+    assert [event["attempt"] for event in requests] == [1, 2, 3]
+
+
+@pytest.mark.anyio
 async def test_openrouter_client_maps_malformed_success_json_to_upstream_error(
     core_settings: CoreSettings,
 ) -> None:
@@ -360,6 +453,64 @@ async def test_openrouter_client_maps_non_finite_usage_cost_to_upstream_error(
 
     with pytest.raises(Exception, match="OpenRouter response usage cost was malformed"):
         await client.complete(_openrouter_request())
+
+
+@pytest.mark.anyio
+async def test_openrouter_client_includes_model_params_when_set(
+    core_settings: CoreSettings,
+) -> None:
+    captured_payloads: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured_payloads.append(json.loads(request.content))
+        return httpx.Response(200, json=_success_response())
+
+    client = OpenRouterClient(
+        core_settings,
+        InMemoryUsageTracker(),
+        transport=httpx.MockTransport(handler),
+        backoff_seconds=0,
+    )
+    request = OpenRouterRequest(
+        **{
+            **_openrouter_request().__dict__,
+            "reasoning_effort": "high",
+            "temperature": 0.4,
+            "max_output_tokens": 512,
+        }
+    )
+
+    await client.complete(request)
+
+    payload = captured_payloads[0]
+    assert payload["reasoning"] == {"effort": "high"}
+    assert payload["temperature"] == 0.4
+    assert payload["max_tokens"] == 512
+
+
+@pytest.mark.anyio
+async def test_openrouter_client_omits_model_params_when_unset(
+    core_settings: CoreSettings,
+) -> None:
+    captured_payloads: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured_payloads.append(json.loads(request.content))
+        return httpx.Response(200, json=_success_response())
+
+    client = OpenRouterClient(
+        core_settings,
+        InMemoryUsageTracker(),
+        transport=httpx.MockTransport(handler),
+        backoff_seconds=0,
+    )
+
+    await client.complete(_openrouter_request())
+
+    payload = captured_payloads[0]
+    assert "reasoning" not in payload
+    assert "temperature" not in payload
+    assert "max_tokens" not in payload
 
 
 @pytest.mark.anyio

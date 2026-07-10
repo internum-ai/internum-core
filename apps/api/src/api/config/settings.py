@@ -48,6 +48,9 @@ class CoreSettings(InternumBaseSettings):
     max_ooxml_compression_ratio: float = Field(default=100.0, gt=0)
     libreoffice_binary: str = Field(default="soffice", min_length=1)
     doc_conversion_timeout_seconds: float = Field(default=30.0, gt=0)
+    default_reasoning_effort: Literal["minimal", "low", "medium", "high"] | None = None
+    default_temperature: float | None = Field(default=None, ge=0, le=2)
+    default_max_output_tokens: int | None = Field(default=None, gt=0)
     api_consumers: list[ApiConsumerSettings] = Field(min_length=1)
 
     @field_validator("default_model", "default_system_prompt", "libreoffice_binary")
