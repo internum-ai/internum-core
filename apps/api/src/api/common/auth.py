@@ -2,10 +2,13 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Annotated
 
-from fastapi import Header, Request
+from fastapi import Request, Security
+from fastapi.security import APIKeyHeader
 
 from api.common.errors import AuthenticationError, ConfigurationError
 from api.config.settings import CoreSettings
+
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 @dataclass(frozen=True)
@@ -22,7 +25,7 @@ def get_settings(request: Request) -> CoreSettings:
 
 async def require_consumer(
     request: Request,
-    api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
+    api_key: Annotated[str | None, Security(api_key_header)] = None,
 ) -> ConsumerIdentity:
     if api_key is None or not api_key:
         raise AuthenticationError("missing_api_key", "Missing API key")
